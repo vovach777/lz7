@@ -28,18 +28,53 @@ int main(int argc, char** argv) {
             assert(len >= 0);
             assert(literals_len >= 0);
 
-            std::cout << std::setw(8) << len << " " << std::setw(8) << offset;
-            if (len == 2) {
+          
+            if (len == ENCODE_MIN) {
+                assert(offset <= 127);
+                assert(literals_len == 0);
+                out.push_back(0x80 | offset );
                 super_short++;
+                
+            } else {
+            //pack length
+           
+            //0xyy zzzz
+            //yy (min=2) 2,3,4,ext8
+            out.push_back((offset > 255 ? 0x40 : 0) && (std::min(len-ENCODE_MIN,3)) << 4 | std::min(literals_len,15));
+            if (literals_len-15 >= 0) {
+                
+                for (int ext255=0;;)
+                {
+                    auto chunk = std::min(literals_len-15-ext255*255,255);
+                    out.push_back( chunk );
+                    if (chunk < 255) break;  
+                    ext255++;
+                }
             }
+            for (int i = 0; i < literals_len; ++i) {
+                out.push_back(literals[i]);
+            }
+            if (len-ENCODE_MIN-3 >= 0) {
+                
+                for (int ext255=0;;)
+                {
+                    auto chunk = std::min(len-ENCODE_MIN-3-ext255*255,255);
+                    out.push_back( chunk );
+                    if (chunk < 255) break;  
+                    ext255++;
+                }
+            }
+            out.push_back(offset & 0xff);
+            if (len > 255) {
+                assert(offset <= 65535);
+                out.push_back(offset >> 8);
+            }
+            }
+                
+            std::cout << std::setw(8) << len << " " << std::setw(8) << offset;
             if (literals_len > 0) {
                 std::cout << " | ";
-                if (literals_len > 15) {
-                    out.push_back('!');
-                }
-                if (literals_len > 255) {
-                    out.push_back('!');
-                }
+            
 
                 while (literals_len--) {
                     out.push_back(*literals);
@@ -48,29 +83,6 @@ int main(int argc, char** argv) {
                 }
              }
              std::cout << std::endl;
-
-            if (len==2) {
-                out.push_back('s');
-            } else
-            if (len>8) {
-                out.push_back('e');
-            }
-            if (len <= 8) {
-                out.push_back('o');
-            } else {
-                out.push_back('O');
-                out.push_back('O');
-            }
-
-
-            // std::cout << len << " " <<lz7::ilog2_32(len,-1)+1
-            //           << " " << offset << " " <<  lz7::ilog2_32(offset,-1)+1
-            //           << " " << literals_len << " " <<  lz7::ilog2_32(literals_len,-1)+1 << std::endl;
-
-
-            // if (lz7::ilog2_32(literals_len,-1)+1 == 9) {
-            //     std::cout << std::string_view((char*)literals, literals_len) << std::endl;
-            // }
 
 
 
