@@ -4,7 +4,7 @@
 #define HAS_BUILTIN_CLZ
 #define WINDOW_N (1 << 24)
 #define ENCODE_MIN (4)
-#define BUCKET_N (16)
+#define BUCKET_N (8)
 #define CHAIN_DISTANCE (8)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
@@ -163,7 +163,7 @@ class TokenSearcher {
     //     return std::distance(it1,a);
     // }
     uint16_t hash_of(const uint8_t* it) const {
-        return reinterpret_cast<const uint16_t*>(it)[0];
+        return static_cast<uint16_t>( reinterpret_cast<const uint32_t*>(it)[0] * 2654435761u >> 16 );
     }
 
 
@@ -225,7 +225,7 @@ class TokenSearcher {
             }
             #endif
             
-            if (best.len < 2) {
+            if (best.len < ENCODE_MIN) {
                 literal_len++;
                 ip++;
             } else {
@@ -233,6 +233,20 @@ class TokenSearcher {
                 encode(best);
                 ip = best.ip2 + best.len;
                 literal_len = 0;
+                // if (best.len > ENCODE_MIN*40) {
+                
+                //     auto chain = tokens[hash_of(best.ofs)];
+                //     // chain.add_if(best.ofs);
+                //     // rank-up!
+                //     auto it = std::find(chain.buffer.begin(), chain.buffer.end(), best.ofs);
+                //     if (it != chain.buffer.end()) {
+                //         if (it != chain.buffer.begin())
+                //             std::swap(*it, *(it-1));
+                //     } else {
+                //         //chain.add(best.ofs);
+                //     }
+                // }
+                
             }
         }
         //put(0xffffff,MAX_MATCH,(literal_len) ? ip - literal_len : nullptr, literal_len);
@@ -251,25 +265,28 @@ class TokenSearcher {
             auto it = chain.buffer[i];
             if (it == nullptr)
                 break;
-            if ( std::distance(it, ip) > WINDOW_N )
-            {
-                continue;
-            }
 
-            assert(ip[0] == it[0]);
-            assert(ip[1] == it[1]);
 
+            // if (reinterpret_cast<const uint32_t*>(it)[0] != reinterpret_cast<const uint32_t*>(ip)[0])
+            // {
+            //     continue;
+            // }
+            // if ( std::distance(it, ip) < ENCODE_MIN )
+            // {
+            //     continue;
+            // }
             auto ip_lim = std::min(ip+MAX_LEN, data_end);
 
-            auto [ it_mismatch, ip_mismatch ] = std::mismatch(it+2, ip, ip+2, ip_lim);
+            auto [ it_mismatch, ip_mismatch ] = std::mismatch(it, ip, ip, ip_lim);
             int match = std::distance(it, it_mismatch);
+            if (match < ENCODE_MIN) {
+                continue;
+            }
             assert( match < MAX_MATCH);
             //back matching
             auto ip2 = ip;
             auto back_len = 0;
-            auto it_end = it + match;
-            int best_i = 0;
-
+   
             while ( match < MAX_MATCH && back_len < literal_len &&  it[-1] == ip2[-1] ) {
                 ++back_len;
                 --it;
@@ -278,24 +295,16 @@ class TokenSearcher {
                     ++match;
             }
 
-            decltype(best) opt = {it, ip2, match};
+            Best opt = {it, ip2, match};
             opt.optimize(literal_len, ip);
 
             if (opt.len && ( opt.len > best.len || (opt.len == best.len && it > best.ofs))) {
-                best = opt;
-                best_i = i;
+                best = opt;             
             } else
             if ( best.len >= 31 /* big enough*/ ) {
                 break;
             }
         }
-        // if (best.ofs && best.len && hash_of(best.ofs) != hash) {
-
-        //     tokens[hash_of(best.ofs) ].add_if(best.ofs);//chain
-        // } 
-        // if (best_i > 0) {
-        //    std::swap(chain.buffer[best_i], chain.buffer[best_i-1]); //rank
-        // }
 
         return best;
     }
