@@ -5,7 +5,7 @@
 #define WINDOW_N (1 << 24)
 #define ENCODE_MIN (4)
 #define BUCKET_N (16)
-#define CHAIN_DISTANCE (8)
+#define CHAIN_DISTANCE (256)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
 #include <algorithm>
@@ -51,7 +51,7 @@ class TokenSearcher {
         }
         inline void smart_add(const uint8_t* val){
             if (buffer[0] == nullptr) {
-                buffer[0] = val;
+                last = buffer[0] = val;
             } else {
                 if (last != nullptr
                     && (
@@ -59,14 +59,13 @@ class TokenSearcher {
                             ||
                             ( val[0]==val[1] && last + 1 == val)
                         )
+                    &&  std::distance(last, val) < CHAIN_DISTANCE
                     )
                 {
-                    auto replace_pos = std::find(buffer.begin(), buffer.end(), last);
-                    if (replace_pos != buffer.end()) {
-                        last = *replace_pos = val;
-                        return;
-                    }
+                    last = val; //keep bigest match ref until CHAIN_DISTANCE
+                    return;
                 }
+        
                 add(last=val);
             }
         }
@@ -123,14 +122,18 @@ class TokenSearcher {
             if ( test_ofs() > 65535) {
                 len = 0;
             }
+            if (test_len() == 0x77 && test_ofs() == 0x7777) {
+                //you ara lucky guys, you found 7777
+                len -= 1;
+            }
             if (len < ENCODE_MIN) {
                 len = 0;
             }
     
             literal_len -= std::distance(ip2, ip);
-            if (len == ENCODE_MIN && literal_len >= 15) {
-                len = 0;
-            }
+            // if (len == 2 && literal_len >= 15) {
+            //     len = 0;
+            // }
             // if (len == ENCODE_MIN && literal_len == 0) {
             //     len = 0;
             // }
@@ -178,8 +181,10 @@ class TokenSearcher {
                 ip+=ENCODE_MIN;
             }
             auto avail = std::distance(ip, data_end);
-            if (avail < ENCODE_MIN*2 ) {
+            if (avail < ENCODE_MIN ) {
                 literal_len+=avail;
+                ip+=avail;
+                put(0x7777,0x77,(literal_len) ? ip - literal_len : nullptr, literal_len);
                 break;
             }
 
@@ -214,16 +219,9 @@ class TokenSearcher {
             assert(ip[0] == it[0]);
             assert(ip[1] == it[1]);
 
+            auto ip_lim = std::min(ip+MAX_LEN, data_end);
 
-            auto max_forward = std::distance(it+2, ip);
-            if (max_forward > MAX_LEN)
-                max_forward = MAX_LEN;
-
-            if ( max_forward <  0 ) {
-                continue;
-            }
-
-            auto [ it_mismatch, ip_mismatch ] = std::mismatch(it+2, ip, ip+2, ip+MAX_LEN);
+            auto [ it_mismatch, ip_mismatch ] = std::mismatch(it+2, ip, ip+2, ip_lim);
             int match = std::distance(it, it_mismatch);
             assert( match < MAX_MATCH);
             //back matching
@@ -244,7 +242,7 @@ class TokenSearcher {
 
             if (opt.len && ( opt.len > best.len || (opt.len == best.len && it > best.ofs))) {
                 best = opt;
-                if (i > 0 && best.len > ENCODE_MIN) {
+                if (i >= 2 ) {
                     std::swap(chain.buffer[i], chain.buffer[i-1]);
                 }
             } else
