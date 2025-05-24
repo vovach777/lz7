@@ -3,7 +3,7 @@
 
 #define HAS_BUILTIN_CLZ
 #define WINDOW_N (1 << 24)
-#define ENCODE_MIN (2)
+#define ENCODE_MIN (4)
 #define BUCKET_N (16)
 #define CHAIN_DISTANCE (8)
 #define MAX_LEN (65535)
@@ -123,20 +123,22 @@ class TokenSearcher {
             if ( test_ofs() > 65535) {
                 len = 0;
             }
-            literal_len -= std::distance(ip2, ip);
-            //euristic optimization
-            if (len == 3 && test_ofs() <= 127 ) {
-                len = 2;
-            } else
-            if (len  == 3 && test_ofs() > 255) {
-                //revert to literal
+            if (len < ENCODE_MIN) {
                 len = 0;
             }
-
-            if (len == 2) {
-                if (literal_len > 0 || test_ofs() > 127)
-                   len = 0;
+    
+            literal_len -= std::distance(ip2, ip);
+            if (len == ENCODE_MIN && literal_len >= 15) {
+                len = 0;
             }
+            // if (len == ENCODE_MIN && literal_len == 0) {
+            //     len = 0;
+            // }
+            //euristic optimization
+            // if (len < 4 && test_ofs() > 255 ) {
+            //     len = 0;
+            // } 
+
         }
 
     } best{};
@@ -242,7 +244,7 @@ class TokenSearcher {
 
             if (opt.len && ( opt.len > best.len || (opt.len == best.len && it > best.ofs))) {
                 best = opt;
-                if (i > 0) {
+                if (i > 0 && best.len > ENCODE_MIN) {
                     std::swap(chain.buffer[i], chain.buffer[i-1]);
                 }
             } else
