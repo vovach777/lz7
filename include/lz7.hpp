@@ -3,14 +3,14 @@
 
 #define HAS_BUILTIN_CLZ
 #define MAX_OFFSET ((1 << 17)-1)
-#define ENCODE_MIN (4)
+#define ENCODE_MIN (3)
 #define BUCKET_N (32)
 #define CHAIN_DISTANCE (8)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
 #define HASH_LOG2 (10)
 #define HASH_SIZE (1 << HASH_LOG2)
-#define LOOK_AHEAD (2)
+#define LOOK_AHEAD (3)
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -93,7 +93,7 @@ class TokenSearcher {
             return len - ENCODE_MIN;
         }
         void optimize(int literal_len, const uint8_t* ip) {
-
+            // euristic optimization
             if ( test_ofs() > MAX_OFFSET) {
                 len = 0;
             }
@@ -106,16 +106,12 @@ class TokenSearcher {
             }
     
             literal_len -= std::distance(ip2, ip);
-            // if (len == 2 && literal_len >= 15) {
-            //     len = 0;
-            // }
-            // if (len == ENCODE_MIN && literal_len == 0) {
-            //     len = 0;
-            // }
-            //euristic optimization
-            // if (len < 4 && test_ofs() > 255 ) {
-            //     len = 0;
-            // } 
+            if (len == 3 && literal_len > 3) {
+                len = 0;
+            }
+            if (len == 3 && test_ofs() > (1<<10)) {
+                len = 0;
+            }
 
         }
 
@@ -126,7 +122,11 @@ class TokenSearcher {
     //     return std::distance(it1,a);
     // }
     uint16_t hash_of(const uint8_t* it) const {
+        #if ENCODE_MIN == 3
+        return static_cast<uint16_t>( (reinterpret_cast<const uint32_t*>(it)[0]&0xffffff) * 2654435761u >> (32-HASH_LOG2) );
+        #else
         return static_cast<uint16_t>( reinterpret_cast<const uint32_t*>(it)[0] * 2654435761u >> (32-HASH_LOG2) );
+        #endif
     }
 
 
@@ -171,12 +171,14 @@ class TokenSearcher {
                 ip++;
             } else {
             #ifdef LOOK_AHEAD
+            if (best.len < 16) //от добра добра не ищут 
             for (int i = 1; i <= LOOK_AHEAD && avail-i >= ENCODE_MIN; ++i) {
                 auto best2 = search_best(ip+i);
                 if (best2.len > best.len+i) {
                     best = best2;
+                    if (best.len > 256) break;
                 } else
-                   break;
+                   break; //не искушаем судьбу
             }           
             #endif
   
