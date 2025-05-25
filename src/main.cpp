@@ -72,25 +72,6 @@ int main(int argc, char** argv) {
                     ext255++;
                 }
             }
-    
-    
-        
-        
-    
-                
-            // std::cout << std::setw(8) << len << " " << std::setw(8) << offset;
-            // if (literals_len > 0) {
-            //     std::cout << " | ";
-            
-
-            //     while (literals_len--) {
-            //         std::cout << ( (*literals >= 32 &&  *literals <= 126) ?  (char)*literals : '.' );
-            //         literals++;
-            //     }
-            //  }
-            //  std::cout << std::endl;
-
-
 
      });
      std::cout << data.size() << " -> " << out.size() << std::fixed << std::setprecision(2) << " (" << (out.size() * 100. / data.size()) << "%)" << std::endl;
