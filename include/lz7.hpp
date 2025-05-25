@@ -4,10 +4,12 @@
 #define HAS_BUILTIN_CLZ
 #define WINDOW_N (1 << 24)
 #define ENCODE_MIN (4)
-#define BUCKET_N (8)
+#define BUCKET_N (32)
 #define CHAIN_DISTANCE (8)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
+#define HASH_LOG2 (10)
+#define HASH_SIZE (1 << HASH_LOG2)
 #define LOOK_AHEAD (2)
 #include <algorithm>
 #include <cassert>
@@ -163,16 +165,16 @@ class TokenSearcher {
     //     return std::distance(it1,a);
     // }
     uint16_t hash_of(const uint8_t* it) const {
-        return static_cast<uint16_t>( reinterpret_cast<const uint32_t*>(it)[0] * 2654435761u >> 16 );
+        return static_cast<uint16_t>( reinterpret_cast<const uint32_t*>(it)[0] * 2654435761u >> (32-HASH_LOG2) );
     }
 
 
     public:
-    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idx(begin), ip(begin), data_begin(begin), data_end(end), tokens(0x10000) {}
+    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idx(begin), ip(begin), data_begin(begin), data_end(end), tokens(HASH_SIZE) {}
 
     void tokenizer() {
 
-        while (idx+1 < ip) {
+        while (idx+4 <= ip) {
             auto& chain = tokens[hash_of(idx)];
             chain.smart_add(idx);
             idx++;
@@ -203,26 +205,33 @@ class TokenSearcher {
             tokenizer();
             auto best = search_best(ip);
             #ifdef LOOK_AHEAD
-            if (best.len == ENCODE_MIN && hash_of(ip) != hash_of(ip+1)) 
-            {
-               
-                auto best2 = search_best(ip+1);
-                auto literal_len_1 = std::distance(best.ip2, ip);
-                auto literal_len_2 = std::distance(best.ip2, ip);
-                if (best2.len == ENCODE_MIN && (literal_len_1 > 0) && (best2.test_ofs() < best.test_ofs()) ) {
+            for (int i = 1; i < 4 && avail-i >= ENCODE_MIN; ++i) {
+                auto best2 = search_best(ip+i);
+                if (best2.len > best.len) {
                     best = best2;
-                }
-                else
-                if (best2.len == ENCODE_MIN+1 && (literal_len_1 > 0)) {
-                    best = best2;
-                }
-                else
-                if (best2.len > ENCODE_MIN+1)
-                {
-                    best = best2;
-                }
-         
+                } else
+                   break;
             }
+            // if (best.len == ENCODE_MIN && hash_of(ip) != hash_of(ip+1)) 
+            // {
+               
+            //     auto best2 = search_best(ip+1);
+            //     auto literal_len_1 = std::distance(best.ip2, ip);
+            //     auto literal_len_2 = std::distance(best.ip2, ip);
+            //     if (best2.len == ENCODE_MIN && (literal_len_1 > 0) && (best2.test_ofs() < best.test_ofs()) ) {
+            //         best = best2;
+            //     }
+            //     else
+            //     if (best2.len == ENCODE_MIN+1 && (literal_len_1 > 0)) {
+            //         best = best2;
+            //     }
+            //     else
+            //     if (best2.len > ENCODE_MIN+1)
+            //     {
+            //         best = best2;
+            //     }
+         
+            // }
             #endif
             
             if (best.len < ENCODE_MIN) {

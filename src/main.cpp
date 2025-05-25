@@ -65,17 +65,17 @@ int main(int argc, char** argv) {
         
     
                 
-            std::cout << std::setw(8) << len << " " << std::setw(8) << offset;
-            if (literals_len > 0) {
-                std::cout << " | ";
+            // std::cout << std::setw(8) << len << " " << std::setw(8) << offset;
+            // if (literals_len > 0) {
+            //     std::cout << " | ";
             
 
-                while (literals_len--) {
-                    std::cout << ( (*literals >= 32 &&  *literals <= 126) ?  (char)*literals : '.' );
-                    literals++;
-                }
-             }
-             std::cout << std::endl;
+            //     while (literals_len--) {
+            //         std::cout << ( (*literals >= 32 &&  *literals <= 126) ?  (char)*literals : '.' );
+            //         literals++;
+            //     }
+            //  }
+            //  std::cout << std::endl;
 
 
 
