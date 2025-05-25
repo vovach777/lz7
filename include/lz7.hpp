@@ -165,21 +165,21 @@ class TokenSearcher {
 
             tokenizer();
             auto best = search_best(ip);
-            #ifdef LOOK_AHEAD
-            for (int i = 1; i <= LOOK_AHEAD && avail-i >= ENCODE_MIN; ++i) {
-                auto best2 = search_best(ip+i);
-                if (best2.len > best.len) {
-                    best = best2;
-                } else
-                   break;
-            }
-            
-            #endif
-            
+          
             if (best.len < ENCODE_MIN) {
                 literal_len++;
                 ip++;
             } else {
+            #ifdef LOOK_AHEAD
+            for (int i = 1; i <= LOOK_AHEAD && avail-i >= ENCODE_MIN; ++i) {
+                auto best2 = search_best(ip+i);
+                if (best2.len > best.len+i) {
+                    best = best2;
+                } else
+                   break;
+            }           
+            #endif
+  
                 literal_len -= std::distance(best.ip2, ip);
                 encode(best);
                 ip = best.ip2 + best.len;
