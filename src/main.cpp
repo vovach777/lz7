@@ -30,9 +30,19 @@ int main(int argc, char** argv) {
         
            
 
-            out.push_back( (std::min(len-ENCODE_MIN,15))  | std::min(literals_len,15) << 4 );
+            //out.push_back( (std::min(len-ENCODE_MIN,15))  | std::min(literals_len,15) << 4 );
+            //1_xx_LL_MMM xxxx_xxxx 
+            bool offset_10 = false;
+            if (offset < (1 << 10) && literals_len < 4 ) {
+                offset_10 = true;
+                out.push_back( 0x80 | ((offset >> 8) << 5)  | (literals_len << 3) | std::min(7,len-ENCODE_MIN) );
+            } else {
+                assert(offset < (1 << 17));
+                //0_x_LLL_MMM xxxx_xxxx xxxx_xxxx
+                out.push_back(  ((offset >> 16) << 6)  | (std::min(7,literals_len) << 3) | std::min(7,len-ENCODE_MIN)  );
+            }
             if (literals_len-15 >= 0) {
-                
+                //offset_10 not pass here
                 for (int ext255=0;;)
                 {
                     auto chunk = std::min(literals_len-15-ext255*255,255);
@@ -45,9 +55,12 @@ int main(int argc, char** argv) {
                 out.push_back(literals[i]);
             }
 
-            assert(offset < 65536);
-            out.push_back( (offset >> 8)  );
+            //assert(offset < 65536);
             out.push_back( offset & 0xff );
+            if (!offset_10) {
+                out.push_back( (offset >> 8) & 0xff );         
+            } 
+        
 
             if (len-ENCODE_MIN-15 >= 0) {
                 

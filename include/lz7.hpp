@@ -2,7 +2,7 @@
 #define LZ7_H
 
 #define HAS_BUILTIN_CLZ
-#define WINDOW_N (1 << 24)
+#define MAX_OFFSET ((1 << 17)-1)
 #define ENCODE_MIN (4)
 #define BUCKET_N (32)
 #define CHAIN_DISTANCE (8)
@@ -26,21 +26,6 @@
 #include <unordered_map>
 #include <tuple>
 #include <array>
-
-namespace lz7 {
-
-
-#define HAS_BUILTIN_CLZ
-inline int ilog2_32(uint32_t v, int error_value = 0) {
-    if (v == 0) return error_value;
-#ifdef HAS_BUILTIN_CLZ
-    return 31 - __builtin_clz(v);
-#else
-    return static_cast<uint32_t>(std::log2(v));
-#endif
-}
-
-}
 
 using Put_function = std::function<void(int offset, int len, const uint8_t * literals, int literals_len )>;
 class TokenSearcher {
@@ -107,38 +92,14 @@ class TokenSearcher {
         auto test_len() const {
             return len - ENCODE_MIN;
         }
-        // void optimize(int literal_len, const uint8_t* ip) {
-
-        //     literal_len -= std::distance(ip2, ip);
-        //     //euristic optimization
-        //     if (len == 3 &&  literal_len == 0 && test_ofs() < 64 ) {
-        //         len = 2;
-        //     } else
-        //     if (len == 3 &&  literal_len == 0 && test_ofs() > 127 ) {
-        //         //revert to literal
-        //         len = 0;
-        //     }
-
-        //     if (len == 3 && literal_len > 0) {
-        //         len = 0;
-        //     }
-
-        //     if (len == 2) {
-        //         if  (literal_len>0)
-        //            len = 0;
-        //         else
-        //         if (test_ofs() > 127 )
-        //            len = 0;
-        //     }
-        // }
         void optimize(int literal_len, const uint8_t* ip) {
 
-            if ( test_ofs() > 65535) {
+            if ( test_ofs() > MAX_OFFSET) {
                 len = 0;
             }
-            if (test_len() == 0x77 && test_ofs() == 0x7777) {
-                //you ara lucky guys, you found 7777
-                len -= 1;
+            if (test_len() == ENCODE_MIN && test_ofs() == (MAX_OFFSET)) {
+                //you ara lucky guys
+                len = 0;
             }
             if (len < ENCODE_MIN) {
                 len = 0;
@@ -198,40 +159,21 @@ class TokenSearcher {
             if (avail < ENCODE_MIN ) {
                 literal_len+=avail;
                 ip+=avail;
-                put(0x7777,0x77,(literal_len) ? ip - literal_len : nullptr, literal_len);
+                put(MAX_OFFSET,ENCODE_MIN,(literal_len) ? ip - literal_len : nullptr, literal_len); //eof marker
                 break;
             }
 
             tokenizer();
             auto best = search_best(ip);
             #ifdef LOOK_AHEAD
-            for (int i = 1; i < 4 && avail-i >= ENCODE_MIN; ++i) {
+            for (int i = 1; i <= LOOK_AHEAD && avail-i >= ENCODE_MIN; ++i) {
                 auto best2 = search_best(ip+i);
                 if (best2.len > best.len) {
                     best = best2;
                 } else
                    break;
             }
-            // if (best.len == ENCODE_MIN && hash_of(ip) != hash_of(ip+1)) 
-            // {
-               
-            //     auto best2 = search_best(ip+1);
-            //     auto literal_len_1 = std::distance(best.ip2, ip);
-            //     auto literal_len_2 = std::distance(best.ip2, ip);
-            //     if (best2.len == ENCODE_MIN && (literal_len_1 > 0) && (best2.test_ofs() < best.test_ofs()) ) {
-            //         best = best2;
-            //     }
-            //     else
-            //     if (best2.len == ENCODE_MIN+1 && (literal_len_1 > 0)) {
-            //         best = best2;
-            //     }
-            //     else
-            //     if (best2.len > ENCODE_MIN+1)
-            //     {
-            //         best = best2;
-            //     }
-         
-            // }
+            
             #endif
             
             if (best.len < ENCODE_MIN) {
