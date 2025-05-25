@@ -88,15 +88,15 @@ class TokenSearcher {
                 return;
             }
      
-            literal_len -= std::distance(ip2, ip);
+            auto literal_penalty = std::distance(ip,ip2);
 
  
   
             if (test_ofs() < (1<<10) && literal_len <= 3) {
-                gain = len - (2 + match_cost(len));
+                gain = len - (2 + match_cost(len) + literal_penalty);
                 return;
             }
-            gain = len - (3 + literal_cost(literal_len) + match_cost(len));
+            gain = len - (3 + literal_cost(literal_len) + match_cost(len) + literal_penalty);
    
 
         }
