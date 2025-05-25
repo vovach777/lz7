@@ -4,11 +4,11 @@
 #define HAS_BUILTIN_CLZ
 #define MAX_OFFSET ((1 << 17)-1)
 #define ENCODE_MIN (3)
-#define BUCKET_N (32)
+#define BUCKET_N (16)
 #define CHAIN_DISTANCE (256)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
-#define HASH_LOG2 (10)
+#define HASH_LOG2 (11)
 #define HASH_SIZE (1 << HASH_LOG2)
 #define LOOK_AHEAD (2)
 #include <algorithm>
@@ -90,7 +90,7 @@ class TokenSearcher {
      
             auto literal_penalty = std::distance(ip,ip2);
 
- 
+            literal_len += literal_penalty;
   
             if (test_ofs() < (1<<10) && literal_len <= 3) {
                 gain = len - (2 + match_cost(len) + literal_penalty);
@@ -135,7 +135,7 @@ class TokenSearcher {
 
     void tokenizer() {
 
-        while (idx < ip + LOOK_AHEAD) {
+        while (idx <= ip-ENCODE_MIN) {
             auto& chain = tokens[hash_of(idx)];
             chain.smart_add(idx);
             idx++;
@@ -166,7 +166,7 @@ class TokenSearcher {
             tokenizer();
             auto best = search_best();
           
-            if ( best.gain < 1 ) {
+            if ( best.gain < 0 ) {
                 int step = std::min<ptrdiff_t>(avail,LOOK_AHEAD+1);
                 literal_len+=1;
                 ip+=1;
@@ -187,7 +187,7 @@ class TokenSearcher {
         Best best{};
         for (auto ip=this->ip; ip <= this->ip+LOOK_AHEAD; ++ip)
         {
-            auto literal_len = this->literal_len + std::distance(ip, this->ip);
+            //auto literal_len = this->literal_len + std::distance(ip, this->ip);
             auto hash = hash_of(ip);
             auto& chain = tokens[hash];
     
@@ -212,11 +212,11 @@ class TokenSearcher {
                 auto ip2 = ip;
                 auto back_len = 0;
 
-                Best before{it, ip2, match };
-                before.optimize(literal_len, this->ip);
-                if (before < best) {
-                    best = before;
-                }
+                // Best before{it, ip2, match };
+                // before.optimize(literal_len, this->ip);
+                // if (before < best) {
+                //     best = before;
+                // }
  
                 while ( match < MAX_MATCH && back_len < literal_len &&  it[-1] == ip2[-1] ) {
                     ++back_len;
@@ -225,11 +225,11 @@ class TokenSearcher {
                     if (it + match != ip2)
                         ++match;
                 }
-                if (back_len == 0)
-                    continue;
+                // if (back_len == 0)
+                //     continue;
 
                 Best after{it, ip2, match };
-                after.optimize(literal_len, this->ip);
+                after.optimize(this->literal_len, this->ip);
 
 
 
