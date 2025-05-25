@@ -41,11 +41,11 @@ int main(int argc, char** argv) {
                 //0_x_LLL_MMM xxxx_xxxx xxxx_xxxx
                 out.push_back(  ((offset >> 16) << 6)  | (std::min(7,literals_len) << 3) | std::min(7,len-ENCODE_MIN)  );
             }
-            if (literals_len-15 >= 0) {
+            if (literals_len-7 >= 0) {
                 //offset_10 not pass here
                 for (int ext255=0;;)
                 {
-                    auto chunk = std::min(literals_len-15-ext255*255,255);
+                    auto chunk = std::min(literals_len-7-ext255*255,255);
                     out.push_back( chunk );
                     if (chunk < 255) break;  
                     ext255++;
@@ -62,11 +62,11 @@ int main(int argc, char** argv) {
             } 
         
 
-            if (len-ENCODE_MIN-15 >= 0) {
+            if (len-ENCODE_MIN-7 >= 0) {
                 
                 for (int ext255=0;;)
                 {
-                    auto chunk = std::min(len-ENCODE_MIN-15-ext255*255,255);
+                    auto chunk = std::min(len-ENCODE_MIN-7-ext255*255,255);
                     out.push_back( chunk );
                     if (chunk < 255) break;  
                     ext255++;

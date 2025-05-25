@@ -5,7 +5,7 @@
 #define MAX_OFFSET ((1 << 17)-1)
 #define ENCODE_MIN (3)
 #define BUCKET_N (32)
-#define CHAIN_DISTANCE (8)
+#define CHAIN_DISTANCE (256)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
 #define HASH_LOG2 (10)
@@ -41,15 +41,7 @@ class TokenSearcher {
             if (buffer[0] == nullptr) {
                 last = buffer[0] = val;
             } else {
-                if (last != nullptr
-                    && (
-                            ( val[0]!=val[1] && last + 2 == val)
-                            ||
-                            ( val[0]==val[1] && last + 1 == val)
-                        )
-                    &&  std::distance(last, buffer[0]) < CHAIN_DISTANCE
-                    )
-                {
+                if (std::distance(last, val) < ENCODE_MIN) {
                     last = val; //keep bigest match ref until CHAIN_DISTANCE
                     return;
                 }
@@ -171,12 +163,12 @@ class TokenSearcher {
                 ip++;
             } else {
             #ifdef LOOK_AHEAD
-            if (best.len < 16) //от добра добра не ищут 
+            if (best.len < 16 && hash_of(ip) != hash_of(ip+1)) //от добра добра не ищут 
             for (int i = 1; i <= LOOK_AHEAD && avail-i >= ENCODE_MIN; ++i) {
                 auto best2 = search_best(ip+i);
                 if (best2.len > best.len+i) {
                     best = best2;
-                    if (best.len > 256) break;
+                    if (best.len > 256) break; // хватит
                 } else
                    break; //не искушаем судьбу
             }           
@@ -220,14 +212,6 @@ class TokenSearcher {
                 break;
 
 
-            // if (reinterpret_cast<const uint32_t*>(it)[0] != reinterpret_cast<const uint32_t*>(ip)[0])
-            // {
-            //     continue;
-            // }
-            // if ( std::distance(it, ip) < ENCODE_MIN )
-            // {
-            //     continue;
-            // }
             auto ip_lim = std::min(ip+MAX_LEN, data_end);
 
             auto [ it_mismatch, ip_mismatch ] = std::mismatch(it, ip, ip, ip_lim);
