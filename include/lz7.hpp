@@ -41,10 +41,10 @@ class TokenSearcher {
             if (buffer[0] == nullptr) {
                 last = buffer[0] = val;
             } else {
-                // if (std::distance(last, val) < ENCODE_MIN) {
-                //     last = val; //keep bigest match ref until CHAIN_DISTANCE
-                //     return;
-                // }
+                if (std::distance(last, val) < ENCODE_MIN) {
+                    last = val; //keep bigest match ref until CHAIN_DISTANCE
+                    return;
+                }
         
                 add(last=val);
             }
@@ -67,13 +67,13 @@ class TokenSearcher {
         const uint8_t* ofs{};
         const uint8_t* ip2{};
         int len{};
-        int cost{0x8000};
+        int gain{-0x8000};
         auto test_ofs() const {
             return std::distance( ofs+len , ip2);
         }
-        auto test_len() const {
-            return len - ENCODE_MIN;
-        }
+
+    
+   
         void optimize(int literal_len, const uint8_t* ip) {
             
             if (len < ENCODE_MIN || test_ofs() > MAX_OFFSET) {
@@ -82,7 +82,7 @@ class TokenSearcher {
             }
             // euristic optimization
       
-            if (test_len() == ENCODE_MIN && test_ofs() == (MAX_OFFSET)) {
+            if (len == ENCODE_MIN && test_ofs() == (MAX_OFFSET)) {
                 //you ara lucky guys
                 len = 0;
                 return;
@@ -93,16 +93,12 @@ class TokenSearcher {
  
   
             if (test_ofs() < (1<<10) && literal_len <= 3) {
-                cost = 2 + match_cost(len);
+                gain = len - (2 + match_cost(len));
                 return;
             }
-            cost = 3 + literal_cost(literal_len) + match_cost(len);
+            gain = len - (3 + literal_cost(literal_len) + match_cost(len));
    
 
-        }
-
-        int test_cost() const {
-            return len - cost;
         }
 
         static uint
@@ -114,6 +110,9 @@ class TokenSearcher {
         static int match_cost(unsigned long len)
         {
             return (len + 255 - ENCODE_MIN - 7) / 255;
+        }
+        bool operator<(const Best& other) const {
+            return gain > other.gain;
         }
 
     };
@@ -167,10 +166,10 @@ class TokenSearcher {
             tokenizer();
             auto best = search_best();
           
-            if (best.len < ENCODE_MIN || best.test_cost() <= 0) {
+            if ( best.gain < 1 ) {
                 int step = std::min<ptrdiff_t>(avail,LOOK_AHEAD+1);
-                literal_len+=step;
-                ip+=step;
+                literal_len+=1;
+                ip+=1;
             } else {
    
   
@@ -215,7 +214,7 @@ class TokenSearcher {
 
                 Best before{it, ip2, match };
                 before.optimize(literal_len, this->ip);
-                if (before.test_cost() > best.test_cost()) {
+                if (before < best) {
                     best = before;
                 }
  
@@ -234,7 +233,7 @@ class TokenSearcher {
 
 
 
-                if (after.test_cost() > best.test_cost())
+                if (after < best)
                     best = after;
 
             }
