@@ -165,7 +165,7 @@ class TokenSearcher {
             }
 
             auto best = search_best();
-            int step = std::min<ptrdiff_t>(avail,std::max(LOOK_AHEAD/2,1));
+            int step = std::min<ptrdiff_t>(avail,std::max(LOOK_AHEAD+1,1));
 
             if ( best.len < ENCODE_MIN || best.gain >= literal_len+step) {
                 literal_len+=step;
@@ -188,7 +188,8 @@ class TokenSearcher {
 
         for (auto ip = this->ip; ip <= ip_lim; ip++ )
         {
-            if (hash_of(ip) == better_hash) {
+            auto chain_breaker = hash_of(ip);
+            if (chain_breaker == better_hash) {
                 continue;
             }
 
@@ -197,6 +198,16 @@ class TokenSearcher {
             {
                 auto it = chain[id].pos;
                 assert(it != nullptr);
+
+                if (hash_of(it) != chain_breaker) {
+                    break;
+                }
+
+
+                if (std::distance(it,ip) > MAX_OFFSET) {
+                    break;
+                }
+
 
                 if (it+ENCODE_MIN > ip) {
                     continue;
@@ -208,9 +219,6 @@ class TokenSearcher {
                 int match = std::distance(it, it_mismatch);
                 if (match < ENCODE_MIN) {
                     continue;
-                }
-                if (std::distance(it,ip) > MAX_OFFSET) {
-                    break;
                 }
 
                 assert( match < MAX_MATCH);
