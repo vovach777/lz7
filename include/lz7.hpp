@@ -4,11 +4,11 @@
 #define HAS_BUILTIN_CLZ
 #define MAX_OFFSET ((1 << 17)-1)
 #define ENCODE_MIN (3)
-#define BUCKET_N (16)
 #define CHAIN_DISTANCE (0)
+#define MAX_FALSE_SEQUENCE_COUNT (12)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
-#define HASH_LOG2 (13)
+#define HASH_LOG2 (15)
 #define HASH_SIZE (1 << HASH_LOG2)
 #define LOOK_AHEAD (2)
 #include <algorithm>
@@ -29,22 +29,47 @@
 
 using Put_function = std::function<void(int offset, int len, const uint8_t * literals, int literals_len )>;
 class TokenSearcher {
-    struct Item
+    struct ChainItem
     {
-        std::array<const uint8_t*,BUCKET_N> buffer;
-        uint8_t pos{0};
-        inline void add(const uint8_t* val){
-            buffer[pos] = val;
-            if (++pos == BUCKET_N)
-                pos = 0;
-        }
-        Item() {
-            std::fill(buffer.begin(), buffer.end(), nullptr);
-        }
-
+        const uint8_t* pos{nullptr};
+        uint16_t next{0xffff};
     };
 
-    std::vector<Item> tokens; //<Byte <Item> tokens;
+    std::vector<uint16_t> hashtabele; //index to chain
+    std::vector<ChainItem> chain;
+    uint16_t next_override_item = 0;
+
+    uint16_t extract_chain_item() {
+        uint16_t id = next_override_item;
+        if (id == 0xfffe)
+            next_override_item = 0; //round
+        else
+            next_override_item = id+1;
+
+        ChainItem& old_item = chain[id];
+        //not empty item
+        if (old_item.pos != nullptr)  {
+            auto& old_index_ref = hashtabele[hash_of(old_item.pos)];
+            if (old_index_ref == id) //was root
+                old_index_ref = 0xffff; //delete ref to it
+        }
+        //clear
+        old_item.pos = nullptr;
+        old_item.next = 0xffff;
+        return id;
+    }
+    void index(const uint8_t* ip) {
+        while (idx+ENCODE_MIN <= ip) {
+            auto id = extract_chain_item();
+            auto& item = chain[id];
+            auto& index_ref = hashtabele[hash_of(idx)];
+            item.pos = idx;
+            item.next = index_ref;
+            index_ref = id;
+            idx += 1;
+        }
+    }
+
     const uint8_t* data_begin;
     const uint8_t* data_end;
     const uint8_t* ip;
@@ -116,16 +141,7 @@ class TokenSearcher {
 
 
     public:
-    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idx(begin), ip(begin), data_begin(begin), data_end(end), tokens(HASH_SIZE) {}
-
-    void tokenizer(const uint8_t* ip) {
-
-        while (idx+ENCODE_MIN <= ip) {
-            auto& chain = tokens[hash_of(idx)];
-            chain.add(idx);
-            idx++;
-        }
-    }
+    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idx(begin), ip(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,0xffff), chain(0x10000,ChainItem{})   {}
 
 
     void encode(const Best & best) {
@@ -151,36 +167,37 @@ class TokenSearcher {
             auto best = search_best();
             int step = std::min<ptrdiff_t>(avail,std::max(LOOK_AHEAD/2,1));
 
-            if ( best.len < ENCODE_MIN || best.gain > literal_len+step) {
+            if ( best.len < ENCODE_MIN || best.gain >= literal_len+step) {
                 literal_len+=step;
                 ip+=step;
             } else {
-
-
                 literal_len -= std::distance(best.ip2, ip);
                 encode(best);
                 ip = best.ip2 + best.len;
                 literal_len = 0;
-
-
             }
         }
         //put(0xffffff,MAX_MATCH,(literal_len) ? ip - literal_len : nullptr, literal_len);
     }
     Best search_best()  {
         Best best{};
-        for (auto ip=this->ip; ip <= this->ip+LOOK_AHEAD; ++ip)
-        {
-            //auto literal_len = this->literal_len + std::distance(ip, this->ip);
-            auto hash = hash_of(ip);
-            auto& chain = tokens[hash];
-            tokenizer(ip);
+        int better_count = 0;
+        auto ip = this->ip;
+        int better_hash = -1;
+        auto ip_lim  = std::min(this->ip+LOOK_AHEAD, data_end-ENCODE_MIN);
 
-            for (int i = 0; i < BUCKET_N; ++i)
+        for (auto ip = this->ip; ip <= ip_lim; ip++ )
+        {
+            if (hash_of(ip) == better_hash) {
+                continue;
+            }
+
+            index(ip);
+            for (int id = hashtabele[hash_of(ip)], false_sequence_count=0; false_sequence_count < MAX_FALSE_SEQUENCE_COUNT &&  id != 0xffff; id = chain[id].next, false_sequence_count++)
             {
-                auto it = chain.buffer[i];
-                if (it == nullptr )
-                    break;
+                auto it = chain[id].pos;
+                assert(it != nullptr);
+
                 if (it+ENCODE_MIN > ip) {
                     continue;
                 }
@@ -192,6 +209,10 @@ class TokenSearcher {
                 if (match < ENCODE_MIN) {
                     continue;
                 }
+                if (std::distance(it,ip) > MAX_OFFSET) {
+                    break;
+                }
+
                 assert( match < MAX_MATCH);
                 //back matching
                 auto ip2 = ip;
@@ -207,10 +228,14 @@ class TokenSearcher {
                 Best after{it, ip2, match };
                 after.optimize(this->literal_len, this->ip);
 
-
-
-                if (after.is_better_than(best))
+                if (after.is_better_than(best)) {
                     best = after;
+                    better_count++;
+                    better_hash = hash_of(ip);
+                }
+                // else
+                //    if ( better_count > 4 )
+                //        return best;
 
             }
         }
