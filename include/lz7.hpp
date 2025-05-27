@@ -74,7 +74,7 @@ class TokenSearcher {
     const uint8_t* data_end;
     const uint8_t* ip;
     const uint8_t* idx;
-    int literal_len = 0;
+    const uint8_t* emitp;
     Put_function put;
 
     struct Best{
@@ -88,7 +88,7 @@ class TokenSearcher {
 
 
 
-        void optimize(int literal_len_orig, const uint8_t* ip) {
+        void optimize(const TokenSearcher& ctx) {
 
             if (len < ENCODE_MIN || test_ofs() > MAX_OFFSET) {
                 len = 0;
@@ -102,10 +102,10 @@ class TokenSearcher {
                 return;
             }
 
-            auto literal_len = std::distance(ip-literal_len_orig,ip2);
+            auto literal_len = std::distance(ctx.emitp,ip2);
 
             if (test_ofs() < (1<<10) && literal_len <= 3) {
-                gain = literal_len + 2 + match_cost(len) - len;
+                gain = literal_len +  2 + match_cost(len) - len;
                 return;
             }
             gain = literal_len + 3 + literal_cost(literal_len) + match_cost(len) - len;
@@ -141,11 +141,25 @@ class TokenSearcher {
 
 
     public:
-    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idx(begin), ip(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,0xffff), chain(0x10000,ChainItem{})   {}
+    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idx(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,0xffff), chain(0x10000,ChainItem{})   {}
 
 
-    void encode(const Best & best) {
-        put(best.test_ofs(), best.len, best.ip2 - literal_len, literal_len);
+    void emit(const Best & best) {
+        assert(best.ip2 >= emitp);
+        if (best.len < ENCODE_MIN) {
+            emit(); //emit as literal
+            return;
+        }
+        put(best.test_ofs(), best.len, emitp, best.ip2 - emitp);
+        emitp = ip = best.ip2 + best.len;
+    }
+
+    void emit() {
+        assert(ip >= emitp);
+        if (ip > emitp) {
+            put(0x1ffff, ENCODE_MIN, emitp, ip - emitp);
+            emitp = ip;
+        }
     }
 
     void compressor() {
@@ -153,101 +167,110 @@ class TokenSearcher {
         for (;;)
         {
             if (ip == data_begin){
-                literal_len=ENCODE_MIN;
                 ip+=ENCODE_MIN;
             }
             auto avail = std::distance(ip, data_end);
-            if (avail < ENCODE_MIN+LOOK_AHEAD ) {
-                literal_len+=avail;
-                ip+=avail;
-                put(MAX_OFFSET,ENCODE_MIN,(literal_len) ? ip - literal_len : nullptr, literal_len); //eof marker
+            if (avail < ENCODE_MIN ) {
+                ip=data_end;
+                emit();
                 break;
             }
 
-            auto best = search_best();
-            int step = std::min<ptrdiff_t>(avail,std::max(LOOK_AHEAD+1,1));
-
-            if ( best.len < ENCODE_MIN || best.gain >= literal_len+step) {
-                literal_len+=step;
-                ip+=step;
-            } else {
-                literal_len -= std::distance(best.ip2, ip);
-                encode(best);
-                ip = best.ip2 + best.len;
-                literal_len = 0;
+            auto greedy_best_match = search_best(ip);
+            if ( greedy_best_match.len < ENCODE_MIN) {
+                ip++;
+                continue;
             }
+            auto greedy_best_match_next_step = search_best(ip+1);
+            if ( greedy_best_match_next_step.gain < greedy_best_match.gain ) {
+                greedy_best_match = greedy_best_match_next_step;
+                assert(greedy_best_match.len >= ENCODE_MIN);
+            }
+//            if (greedy_best_match_next_step.gain >= greedy_best_match.gain) {
+                if (greedy_best_match.len > ENCODE_MIN) {
+                    //check it hide a better match
+                    auto lazy_best_match = search_best(ip+ENCODE_MIN);
+                    if (lazy_best_match.gain < greedy_best_match.gain) {
+                        //check it hide short match previously finded
+                        auto intersection = greedy_best_match.ip2 - lazy_best_match.ip2;
+                        if ( intersection < ENCODE_MIN ) {
+                            emit(lazy_best_match);
+                        } else {
+                            greedy_best_match.len = intersection;
+                            emit(greedy_best_match);
+                            emit(lazy_best_match);
+                        }
+                    } else {
+                        emit(greedy_best_match);
+                    }
+                } else {
+                    emit(greedy_best_match);
+                }
+
+            // } else {
+            //     //шаг дальше хуже кодирование сейчас
+            //     emit(greedy_best_match);
+            // }
+
+
         }
-        //put(0xffffff,MAX_MATCH,(literal_len) ? ip - literal_len : nullptr, literal_len);
+
     }
-    Best search_best()  {
+    Best search_best( const uint8_t* ip) {
         Best best{};
         int better_count = 0;
-        auto ip = this->ip;
         int better_hash = -1;
-        auto ip_lim  = std::min(this->ip+LOOK_AHEAD, data_end-ENCODE_MIN);
+        auto chain_breaker = hash_of(ip);
 
-        for (auto ip = this->ip; ip <= ip_lim; ip++ )
+        index(ip);
+        for (int id = hashtabele[hash_of(ip)], false_sequence_count=0; false_sequence_count < MAX_FALSE_SEQUENCE_COUNT &&  id != 0xffff; id = chain[id].next, false_sequence_count++)
         {
-            auto chain_breaker = hash_of(ip);
-            if (chain_breaker == better_hash) {
+            auto it = chain[id].pos;
+            assert(it != nullptr);
+
+            if (hash_of(it) != chain_breaker) {
+                break;
+            }
+
+
+            if (std::distance(it,ip) > MAX_OFFSET) {
+                break;
+            }
+
+
+            if (it+ENCODE_MIN > ip) {
                 continue;
             }
 
-            index(ip);
-            for (int id = hashtabele[hash_of(ip)], false_sequence_count=0; false_sequence_count < MAX_FALSE_SEQUENCE_COUNT &&  id != 0xffff; id = chain[id].next, false_sequence_count++)
-            {
-                auto it = chain[id].pos;
-                assert(it != nullptr);
+            auto ip_lim = std::min(ip+MAX_LEN, data_end);
 
-                if (hash_of(it) != chain_breaker) {
-                    break;
-                }
+            auto [ it_mismatch, ip_mismatch ] = std::mismatch(it, ip, ip, ip_lim);
+            int match = std::distance(it, it_mismatch);
+            if (match < ENCODE_MIN) {
+                continue;
+            }
 
+            assert( match < MAX_MATCH);
+            //back matching
+            auto ip2 = ip;
 
-                if (std::distance(it,ip) > MAX_OFFSET) {
-                    break;
-                }
+            while ( match < MAX_MATCH && ip2 > emitp  &&  it[-1] == ip2[-1] ) {
+                --it;
+                --ip2;
+                if (it + match != ip2)
+                    ++match;
+            }
 
+            Best after{it, ip2, match };
+            after.optimize(*this);
 
-                if (it+ENCODE_MIN > ip) {
-                    continue;
-                }
-
-                auto ip_lim = std::min(ip+MAX_LEN, data_end);
-
-                auto [ it_mismatch, ip_mismatch ] = std::mismatch(it, ip, ip, ip_lim);
-                int match = std::distance(it, it_mismatch);
-                if (match < ENCODE_MIN) {
-                    continue;
-                }
-
-                assert( match < MAX_MATCH);
-                //back matching
-                auto ip2 = ip;
-
-                auto back_lim = this->ip-this->literal_len;
-                while ( match < MAX_MATCH && ip2 > back_lim  &&  it[-1] == ip2[-1] ) {
-                    --it;
-                    --ip2;
-                    if (it + match != ip2)
-                        ++match;
-                }
-
-                Best after{it, ip2, match };
-                after.optimize(this->literal_len, this->ip);
-
-                if (after.is_better_than(best)) {
-                    best = after;
-                    better_count++;
-                    better_hash = hash_of(ip);
-                }
-                // else
-                //    if ( better_count > 4 )
-                //        return best;
-
+            if (after.is_better_than(best)) {
+                best = after;
+                better_count++;
+                better_hash = hash_of(ip);
             }
         }
-        return best;
+    return best;
     }
 };
 
