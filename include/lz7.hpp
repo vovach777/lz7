@@ -4,13 +4,13 @@
 #define HAS_BUILTIN_CLZ
 #define MAX_OFFSET ((1 << 17)-1)
 #define ENCODE_MIN (3)
-#define CHAIN_DISTANCE (0)
+#define CHAIN_DISTANCE (64)
 #define MAX_FALSE_SEQUENCE_COUNT (32)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
 #define HASH_LOG2 (16)
 #define HASH_SIZE (1 << HASH_LOG2)
-#define LOOK_AHEAD (2)
+#define LOOK_AHEAD (8)
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -33,39 +33,54 @@ class TokenSearcher {
     {
         const uint8_t* pos{nullptr};
         uint16_t next{0xffff};
+        uint16_t hash{0xffff};
     };
 
     std::vector<uint16_t> hashtabele; //index to chain
     std::vector<ChainItem> chain;
     uint16_t next_override_item = 0;
 
-    uint16_t extract_chain_item() {
+    void register_chain_item(const uint8_t* idx) {
         uint16_t id = next_override_item;
         if (id == 0xfffe)
             next_override_item = 0; //round
         else
             next_override_item = id+1;
 
-        ChainItem& old_item = chain[id];
+        ChainItem& item = chain[id];
         //not empty item
-        if (old_item.pos != nullptr)  {
-            auto& old_index_ref = hashtabele[hash_of(old_item.pos)];
-            if (old_index_ref == id) //was root
-                old_index_ref = 0xffff; //delete ref to it
+        if (item.pos != nullptr)  {
+            if (hashtabele[item.hash] == id)
+                hashtabele[item.hash] = 0xffff; //unregister
         }
         //clear
-        old_item.pos = nullptr;
-        old_item.next = 0xffff;
-        return id;
+        item.pos = idx;
+        item.hash = hash_of(idx);
+        item.next = hashtabele[item.hash];
+        hashtabele[item.hash] = id;
     }
+    int current_idx_rle = 0;
     void index(const uint8_t* ip) {
+
         while (idx+ENCODE_MIN <= ip) {
-            auto id = extract_chain_item();
-            auto& item = chain[id];
-            auto& index_ref = hashtabele[hash_of(idx)];
-            item.pos = idx;
-            item.next = index_ref;
-            index_ref = id;
+            auto last_registred = chain[ hash_of(idx) ];
+
+            if ( idx[0] == idx[+1]) {
+                if ( ((current_idx_rle -1) & current_idx_rle) == 0) {
+                    if (current_idx_rle == 0 || current_idx_rle > 4) {
+                        register_chain_item(idx);
+                        if (current_idx_rle >= 8)
+                            std::cout << "RLE: " << std::string_view((const char*)idx-current_idx_rle, std::min(16, current_idx_rle) ) << "/" <<  current_idx_rle << std::endl;
+                    }
+                }
+                current_idx_rle += 1;
+
+            } else {
+
+                register_chain_item(idx);
+                current_idx_rle = 0;
+
+            }
             idx += 1;
         }
     }
@@ -177,14 +192,12 @@ class TokenSearcher {
                 break;
             }
 
-            auto greedy_best_match = search_best(ip);
+            auto greedy_best_match = search_best(ip, nullptr, true);
             if ( greedy_best_match.len < ENCODE_MIN) {
                 ip++;
                 continue;
             }
-            if (greedy_best_match.gain >= -1 &&
-                (greedy_best_match.test_ofs() < (1<<10) &&  greedy_best_match.ip2 - emitp == 3)
-                || (greedy_best_match.ip2 - emitp == 6 ))
+            if ( greedy_best_match.test_ofs() < (1<<10) &&  greedy_best_match.ip2 - emitp == 3)
             {
                 emit(greedy_best_match);
                 continue; //keep literals low
@@ -207,37 +220,17 @@ class TokenSearcher {
             //     emit(greedy_best_match);
             //     continue;
             // }
-            //check if can split greedy match with lazy
+
             Best lazy_best_match = greedy_best_match;
-            for (int i = LOOK_AHEAD; i >= 1; --i) {
-                auto lazy_match = search_best(ip+i);
-                if (lazy_match.gain <= lazy_best_match.gain) {
+            for (int i = 1; i <= LOOK_AHEAD; ++i) {
+                auto lazy_match = search_best(lazy_best_match.ip2+2, lazy_best_match.ip2+2 - lazy_best_match.len);
+                if (lazy_match.gain < lazy_best_match.gain) {
                     lazy_best_match = lazy_match;
-                    if (lazy_best_match.ip2 <= greedy_best_match.ip2) {
-                        break;
-                    }
-
-                }
-            }
-
-            //check if hide short match previously finded
-            #if 0
-            //experiment: split agreed match instanded of revert to literals - no luck!
-            if (greedy_best_match.ip2 < lazy_best_match.ip2 )  {
-
-                auto intersection = greedy_best_match.ip2 + greedy_best_match.len - lazy_best_match.ip2;
-                if ( intersection < 0 && greedy_best_match.gain < 0) {
-                    emit(greedy_best_match);
-                    continue;
                 } else
-                if (intersection >= 0 && greedy_best_match.len-intersection >= ENCODE_MIN) {
-                    greedy_best_match.len -= intersection;
-                    greedy_best_match.optimize(*this);
-                    if (greedy_best_match.len >= ENCODE_MIN && greedy_best_match.gain < 0)
-                        emit(greedy_best_match);
-                }
+                   break;
+
             }
-            #endif
+
             emit(lazy_best_match);
 
 
@@ -245,29 +238,41 @@ class TokenSearcher {
         }
 
     }
-    Best search_best( const uint8_t* ip) {
+    Best search_best( const uint8_t* ip, const uint8_t* fast_skip=nullptr, bool first_short_match=false) {
         Best best{};
-        // int better_count = 0;
-        // int better_hash = -1;
         auto chain_breaker = hash_of(ip);
-
+        auto prev_pos = data_end;
         index(ip);
-        for (int id = hashtabele[hash_of(ip)], false_sequence_count=0; false_sequence_count < MAX_FALSE_SEQUENCE_COUNT &&  id != 0xffff; id = chain[id].next, false_sequence_count++)
+
+        for (int id = hashtabele[chain_breaker], false_sequence_count=0; false_sequence_count < MAX_FALSE_SEQUENCE_COUNT &&  id != 0xffff; id = chain[id].next, false_sequence_count++)
         {
-            auto it = chain[id].pos;
+            const auto &item = chain[id];
+            auto it = item.pos;
             assert(it != nullptr);
 
-            if (hash_of(it) != chain_breaker) {
+            if (item.hash != chain_breaker) {
                 break;
             }
 
-
-            if (std::distance(it,ip) > MAX_OFFSET) {
+            if (it >= prev_pos) {
+                //std::cerr << "break by pos!" << std::endl;
                 break;
             }
 
+            if (std::distance(it,ip) > MAX_OFFSET+32) {
+                break;
+            }
 
+            //pre-hashing happens...
             if (it+ENCODE_MIN > ip) {
+                continue;
+            }
+
+            prev_pos = it;
+
+            //fast skip
+            if (fast_skip && it > fast_skip) {
+                false_sequence_count = 0;
                 continue;
             }
 
@@ -293,10 +298,11 @@ class TokenSearcher {
             Best after{it, ip2, match };
             after.optimize(*this);
 
-            if (after.is_better_than(best)) {
+            if (after.gain < best.gain) {
                 best = after;
-                // better_count++;
-                // better_hash = hash_of(ip);
+                if ( first_short_match && best.test_ofs() < (1<<10) ) {
+                    break;
+                }
             }
         }
     return best;
