@@ -111,6 +111,7 @@ class TokenSearcher {
             gain = literal_len + 3 + literal_cost(literal_len) + match_cost(len) - len;
         }
 
+
         static int literal_cost(unsigned long nlit)
         {
             return (nlit + 255 - 7) / 255;
@@ -181,6 +182,15 @@ class TokenSearcher {
                 ip++;
                 continue;
             }
+            if (greedy_best_match.gain >= -1 &&
+                (greedy_best_match.test_ofs() < (1<<10) &&  greedy_best_match.ip2 - emitp == 3)
+                || (greedy_best_match.ip2 - emitp == 6 ))
+            {
+                emit(greedy_best_match);
+                continue; //keep literals low
+
+            }
+
             // auto greedy_best_match_next_step = search_best(ip+1);
             // if ( greedy_best_match_next_step.gain >= greedy_best_match.gain) {
             //     emit(greedy_best_match);
@@ -211,16 +221,25 @@ class TokenSearcher {
             }
 
             //check if hide short match previously finded
-            // auto intersection = greedy_best_match.ip2 + greedy_best_match.len - lazy_best_match.ip2;
-            // if ( intersection < 0 && greedy_best_match.gain <= 0) {
-            //     emit(greedy_best_match);
-            //     //continue;
-            // } else
-            // if (intersection >= 0 && greedy_best_match.len-intersection >= ENCODE_MIN) {
-            //     greedy_best_match.len -= intersection;
-            //     emit(greedy_best_match);
-            // }
+            #if 0
+            //experiment: split agreed match instanded of revert to literals - no luck!
+            if (greedy_best_match.ip2 < lazy_best_match.ip2 )  {
+
+                auto intersection = greedy_best_match.ip2 + greedy_best_match.len - lazy_best_match.ip2;
+                if ( intersection < 0 && greedy_best_match.gain < 0) {
+                    emit(greedy_best_match);
+                    continue;
+                } else
+                if (intersection >= 0 && greedy_best_match.len-intersection >= ENCODE_MIN) {
+                    greedy_best_match.len -= intersection;
+                    greedy_best_match.optimize(*this);
+                    if (greedy_best_match.len >= ENCODE_MIN && greedy_best_match.gain < 0)
+                        emit(greedy_best_match);
+                }
+            }
+            #endif
             emit(lazy_best_match);
+
 
 
         }
