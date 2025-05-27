@@ -5,10 +5,10 @@
 #define MAX_OFFSET ((1 << 17)-1)
 #define ENCODE_MIN (3)
 #define CHAIN_DISTANCE (0)
-#define MAX_FALSE_SEQUENCE_COUNT (12)
+#define MAX_FALSE_SEQUENCE_COUNT (32)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
-#define HASH_LOG2 (15)
+#define HASH_LOG2 (16)
 #define HASH_SIZE (1 << HASH_LOG2)
 #define LOOK_AHEAD (2)
 #include <algorithm>
@@ -181,36 +181,46 @@ class TokenSearcher {
                 ip++;
                 continue;
             }
-            auto greedy_best_match_next_step = search_best(ip+1);
-            if ( greedy_best_match_next_step.gain < greedy_best_match.gain ) {
-                greedy_best_match = greedy_best_match_next_step;
-                assert(greedy_best_match.len >= ENCODE_MIN);
-            }
-//            if (greedy_best_match_next_step.gain >= greedy_best_match.gain) {
-                if (greedy_best_match.len > ENCODE_MIN) {
-                    //check it hide a better match
-                    auto lazy_best_match = search_best(ip+ENCODE_MIN);
-                    if (lazy_best_match.gain < greedy_best_match.gain) {
-                        //check it hide short match previously finded
-                        auto intersection = greedy_best_match.ip2 - lazy_best_match.ip2;
-                        if ( intersection < ENCODE_MIN ) {
-                            emit(lazy_best_match);
-                        } else {
-                            greedy_best_match.len = intersection;
-                            emit(greedy_best_match);
-                            emit(lazy_best_match);
-                        }
-                    } else {
-                        emit(greedy_best_match);
-                    }
-                } else {
-                    emit(greedy_best_match);
-                }
+            // auto greedy_best_match_next_step = search_best(ip+1);
+            // if ( greedy_best_match_next_step.gain >= greedy_best_match.gain) {
+            //     emit(greedy_best_match);
+            //     continue;
+            //     //greedy_best_match = greedy_best_match_next_step;
+            //     //assert(greedy_best_match.len >= ENCODE_MIN);
 
-            // } else {
-            //     //шаг дальше хуже кодирование сейчас
+            // }
+            // greedy_best_match = greedy_best_match_next_step;
+
+
+            // if ( greedy_best_match.gain < -4) {
+            //     /* not realy hiding realy good next match... acceptobly! */
+            //     emit(greedy_best_match);
+            //     continue;
+            // }
+            //check if can split greedy match with lazy
+            Best lazy_best_match = greedy_best_match;
+            for (int i = LOOK_AHEAD; i >= 1; --i) {
+                auto lazy_match = search_best(ip+i);
+                if (lazy_match.gain <= lazy_best_match.gain) {
+                    lazy_best_match = lazy_match;
+                    if (lazy_best_match.ip2 <= greedy_best_match.ip2) {
+                        break;
+                    }
+
+                }
+            }
+
+            //check if hide short match previously finded
+            // auto intersection = greedy_best_match.ip2 + greedy_best_match.len - lazy_best_match.ip2;
+            // if ( intersection < 0 && greedy_best_match.gain <= 0) {
+            //     emit(greedy_best_match);
+            //     //continue;
+            // } else
+            // if (intersection >= 0 && greedy_best_match.len-intersection >= ENCODE_MIN) {
+            //     greedy_best_match.len -= intersection;
             //     emit(greedy_best_match);
             // }
+            emit(lazy_best_match);
 
 
         }
@@ -218,8 +228,8 @@ class TokenSearcher {
     }
     Best search_best( const uint8_t* ip) {
         Best best{};
-        int better_count = 0;
-        int better_hash = -1;
+        // int better_count = 0;
+        // int better_hash = -1;
         auto chain_breaker = hash_of(ip);
 
         index(ip);
@@ -266,8 +276,8 @@ class TokenSearcher {
 
             if (after.is_better_than(best)) {
                 best = after;
-                better_count++;
-                better_hash = hash_of(ip);
+                // better_count++;
+                // better_hash = hash_of(ip);
             }
         }
     return best;
