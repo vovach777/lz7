@@ -131,10 +131,10 @@ class TokenSearcher {
             auto literal_len = std::distance(ctx.emitp,ip2);
 
             if (test_ofs() < (1<<10) && literal_len <= 3) {
-                gain = literal_len +  3 + match_cost(len) - len;
+                gain = literal_len +  2 + match_cost(len) - len;
                 return;
             }
-            gain = literal_len + 4 + literal_cost(literal_len) + match_cost(len) - len;
+            gain = literal_len + 3 + literal_cost(literal_len) + match_cost(len) - len;
         }
 
 
