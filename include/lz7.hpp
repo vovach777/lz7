@@ -5,12 +5,18 @@
 #define MAX_OFFSET ((1 << 17)-1)
 #define ENCODE_MIN (3)
 #define CHAIN_DISTANCE (64)
-#define MAX_FALSE_SEQUENCE_COUNT (32)
+#define MAX_FALSE_SEQUENCE_COUNT (256)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
-#define HASH_LOG2 (16)
+#define HASH_LOG2 (17)
 #define HASH_SIZE (1 << HASH_LOG2)
-#define LOOK_AHEAD (8)
+#define CHAIN_LOG2 (13)
+#define CHAIN_SIZE (1 << CHAIN_LOG2)
+#define CHAIN_BREAK (CHAIN_SIZE - 1)    
+#define LOOK_AHEAD (2)
+#if CHAIN_LOG2 > 16
+#error "CHAIN_LOG2 > chain is uint16_t only"
+#endif
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -32,8 +38,8 @@ class TokenSearcher {
     struct ChainItem
     {
         const uint8_t* pos{nullptr};
-        uint16_t next{0xffff};
-        uint16_t hash{0xffff};
+        uint16_t next{CHAIN_BREAK};
+        uint16_t hash{};
     };
 
     std::vector<uint16_t> hashtabele; //index to chain
@@ -42,7 +48,7 @@ class TokenSearcher {
 
     void register_chain_item(const uint8_t* idx) {
         uint16_t id = next_override_item;
-        if (id == 0xfffe)
+        if (id == CHAIN_BREAK)
             next_override_item = 0; //round
         else
             next_override_item = id+1;
@@ -51,7 +57,7 @@ class TokenSearcher {
         //not empty item
         if (item.pos != nullptr)  {
             if (hashtabele[item.hash] == id)
-                hashtabele[item.hash] = 0xffff; //unregister
+                hashtabele[item.hash] = CHAIN_BREAK; //unregister
         }
         //clear
         item.pos = idx;
@@ -63,8 +69,6 @@ class TokenSearcher {
     void index(const uint8_t* ip) {
 
         while (idx+ENCODE_MIN <= ip) {
-            auto last_registred = chain[ hash_of(idx) ];
-
             if ( idx[0] == idx[+1]) {
                 if ( ((current_idx_rle -1) & current_idx_rle) == 0) {
                     if (current_idx_rle == 0 || current_idx_rle > 4) {
@@ -100,7 +104,7 @@ class TokenSearcher {
         auto test_ofs() const {
             return std::distance( ofs+len , ip2);
         }
-
+        bool is_self_reference(const TokenSearcher& ctx) const { return ofs + len >= ctx.emitp; }
 
 
         void optimize(const TokenSearcher& ctx) {
@@ -157,7 +161,7 @@ class TokenSearcher {
 
 
     public:
-    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idx(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,0xffff), chain(0x10000,ChainItem{})   {}
+    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idx(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,CHAIN_BREAK), chain(CHAIN_SIZE,ChainItem{})   {}
 
 
     void emit(const Best & best) {
@@ -192,17 +196,21 @@ class TokenSearcher {
                 break;
             }
 
-            auto greedy_best_match = search_best(ip, nullptr, true);
+            auto greedy_best_match = search_best(ip, nullptr, ip - emitp <= 3);
             if ( greedy_best_match.len < ENCODE_MIN) {
                 ip++;
                 continue;
             }
-            if ( greedy_best_match.test_ofs() < (1<<10) &&  greedy_best_match.ip2 - emitp == 3)
-            {
+            if ( greedy_best_match.is_self_reference(*this)) {
                 emit(greedy_best_match);
-                continue; //keep literals low
-
+                continue;
             }
+            // if ( greedy_best_match.test_ofs() < (1<<10) &&  greedy_best_match.ip2 - emitp == 3)
+            // {
+            //     emit(greedy_best_match);
+            //     continue; //keep literals low
+
+            // }
 
             // auto greedy_best_match_next_step = search_best(ip+1);
             // if ( greedy_best_match_next_step.gain >= greedy_best_match.gain) {
@@ -222,12 +230,23 @@ class TokenSearcher {
             // }
 
             Best lazy_best_match = greedy_best_match;
-            for (int i = 1; i <= LOOK_AHEAD; ++i) {
-                auto lazy_match = search_best(lazy_best_match.ip2+2, lazy_best_match.ip2+2 - lazy_best_match.len);
+            //uto sp = std::max(ip+1, greedy_best_match.ip2 + greedy_best_match.len);   
+            for (int i = 1; i <= LOOK_AHEAD; ++i) {       
+                // if (sp+8 > data_end) {
+                //     break;
+                // }
+                // if ( hash_of(sp) == hash_of(lazy_best_match.ip2) ) {
+                //     break;
+                // }
+                // if ( hash_of(sp) == hash_of(lazy_best_match.ip2+1) ) {
+                //     break;
+                // }      
+                auto lazy_match = search_best(ip+i, ip+i - lazy_best_match.len);
+                
                 if (lazy_match.gain < lazy_best_match.gain) {
                     lazy_best_match = lazy_match;
-                } else
-                   break;
+                }
+
 
             }
 
@@ -238,13 +257,13 @@ class TokenSearcher {
         }
 
     }
-    Best search_best( const uint8_t* ip, const uint8_t* fast_skip=nullptr, bool first_short_match=false) {
+    Best search_best( const uint8_t* ip, const uint8_t* fast_skip=nullptr, bool short_match_only=false) {
         Best best{};
         auto chain_breaker = hash_of(ip);
         auto prev_pos = data_end;
         index(ip);
 
-        for (int id = hashtabele[chain_breaker], false_sequence_count=0; false_sequence_count < MAX_FALSE_SEQUENCE_COUNT &&  id != 0xffff; id = chain[id].next, false_sequence_count++)
+        for (int id = hashtabele[chain_breaker], false_sequence_count=0; false_sequence_count < MAX_FALSE_SEQUENCE_COUNT &&  id != CHAIN_BREAK; id = chain[id].next, false_sequence_count++)
         {
             const auto &item = chain[id];
             auto it = item.pos;
@@ -294,15 +313,16 @@ class TokenSearcher {
                 if (it + match != ip2)
                     ++match;
             }
+            assert(ip2 >= emitp);
+            assert(it + match <= ip2);
 
             Best after{it, ip2, match };
             after.optimize(*this);
-
+            if ( short_match_only && best.test_ofs() >= (1<<10) )
+                    break;
             if (after.gain < best.gain) {
                 best = after;
-                if ( first_short_match && best.test_ofs() < (1<<10) ) {
-                    break;
-                }
+                
             }
         }
     return best;
