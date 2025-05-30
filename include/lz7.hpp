@@ -5,7 +5,7 @@
 #define MAX_OFFSET ((1 << 17)-1)
 #define NO_MATCH_OFS (MAX_OFFSET)
 #define ENCODE_MIN (3)
-#define MAX_FALSE_SEQUENCE_COUNT (1024)
+#define MAX_FALSE_SEQUENCE_COUNT (32)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
 #define HASH_LOG2 (16)
@@ -71,9 +71,9 @@ class TokenSearcher {
             if ( idx[0] == idx[+1]) {
                 if ( ((current_idx_rle -1) & current_idx_rle) == 0) {
                     if (current_idx_rle == 0 || current_idx_rle > 4) {
-                        register_chain_item(idx);
-                        if (current_idx_rle >= 8)
-                            std::cout << "RLE: " << std::string_view((const char*)idx-current_idx_rle, std::min(16, current_idx_rle) ) << "/" <<  current_idx_rle << std::endl;
+                        // register_chain_item(idx);
+                        // if (current_idx_rle >= 8)
+                        //     std::cout << "RLE: " << std::string_view((const char*)idx-current_idx_rle, std::min(16, current_idx_rle) ) << "/" <<  current_idx_rle << std::endl;
                     }
                 }
                 current_idx_rle += 1;
@@ -99,7 +99,7 @@ class TokenSearcher {
         const uint8_t* ofs{};
         const uint8_t* ip2{};
         int len{};
-        int gain{0x8000};
+        int gain{MAX_OFFSET};
         bool is_self_reference(const TokenSearcher& ctx) const {
             return ofs + len > ctx.emitp;
         }
@@ -122,28 +122,19 @@ class TokenSearcher {
                 len = 0;
                 return;
             }
+            int thelen = len;
 
             auto literal_len = std::distance(ctx.emitp,ip2);
-            auto effective_len = std::min(len, (int)std::distance(ofs, ctx.emitp) );
-
-            // if ( is_self_reference(ctx)) {
-            //     std::cerr << "self reference count: " <<  self_reference_count(ctx) << " literal_len: " << literal_len << " len: " << len << " effective_len: " << effective_len << std::endl;
-            // }
-            int cost;
+            auto literal_match_part = std::distance(ofs+len,ctx.emitp);
+            if (literal_match_part < 0) {
+                thelen += literal_match_part;
+            }
 
             if (test_ofs() < (1<<10) && literal_len <= 3) {
-                cost =   2 + match_cost(len);
-
-            } else {
-                cost =  3 + literal_cost(literal_len) + match_cost(len);
+                gain = literal_len +  2 + match_cost(len) - thelen;
+                return;
             }
-            gain = (literal_len*4 - effective_len*4) * cost;
-            // if (gain > 0) {
-            //     gain <<= 1;
-            // } else
-            //     gain >>= 1;
-
-
+            gain = literal_len + 3 + literal_cost(literal_len) + match_cost(len) - thelen;
         }
 
 
@@ -201,40 +192,25 @@ class TokenSearcher {
             ip = data_end;
         };
 
-        std::optional<Best> lazy_best{};
         for (;;)
         {
             if (ip + ENCODE_MIN > data_end){
-                if (lazy_best) {
-                    emit(*lazy_best);
-                    lazy_best = std::nullopt;
-                }
                 emit();
                 break;
-            }
-            if (lazy_best && lazy_best->ofs+(lazy_best->len>>1) <= ip) {
-                emit(*lazy_best);
-                lazy_best = std::nullopt;
             }
             auto match = search_best(ip);
             if (match.len < ENCODE_MIN) {
                 ip++;
                 continue;
             }
-            if (!lazy_best || match.gain < lazy_best->gain) {
-                lazy_best = match;
-            }
-            ip++;
-
+            emit(match);
         }
 
     }
-    Best search_best( const uint8_t* ip, const uint8_t* fast_skip=nullptr) {
+    Best search_best( const uint8_t* ip, const uint8_t* fast_skip=nullptr, bool first_short_match=false) {
         Best best{};
         auto chain_breaker = hash_of(ip);
         auto prev_pos = data_end;
-        if (fast_skip == nullptr)
-            fast_skip = ip;
         index(ip);
 
         for (int id = hashtabele[chain_breaker], false_sequence_count=0; false_sequence_count < MAX_FALSE_SEQUENCE_COUNT &&  id != CHAIN_BREAK; id = chain[id].next, false_sequence_count++)
@@ -258,17 +234,16 @@ class TokenSearcher {
             }
 
             //pre-hashing happens...
-            if (it+ENCODE_MIN > fast_skip) {
+            //fast skip
+            if (it+ENCODE_MIN > ip) {
                 false_sequence_count = 0;
                 continue;
             }
-
-            // if ( (ip+ENCODE_MIN - it)  < min_match) {
-            //     //std::cerr << emitp-it << " : fast rewind optimization!" << std::endl;
-            //     false_sequence_count = 0;
-            //     continue;
-            // }
-
+            //fast skip
+            if (fast_skip && it > fast_skip) {
+                false_sequence_count = 0;
+                continue;
+            }
 
             auto ip_lim = std::min(ip+MAX_LEN, data_end);
 
@@ -282,8 +257,6 @@ class TokenSearcher {
             //back matching
             auto ip2 = ip;
 
-
-
             while ( match < MAX_MATCH && ip2 > emitp  &&  it[-1] == ip2[-1] ) {
                 --it;
                 --ip2;
@@ -295,8 +268,15 @@ class TokenSearcher {
 
             Best after{it, ip2, match };
             after.optimize(*this);
-            if (after.gain  < best.gain) {
+
+            if (after.gain < best.gain) {
                 best = after;
+                if ( first_short_match && best.test_ofs() < (1<<10) ) {
+                    break;
+                }
+                fast_skip = best.ofs;
+                false_sequence_count >>= 2;
+
             }
         }
     return best;
