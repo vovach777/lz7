@@ -70,8 +70,8 @@ class TokenSearcher {
         while (idx+ENCODE_MIN <= ip) {
             if ( idx[0] == idx[+1]) {
                 if ( ((current_idx_rle -1) & current_idx_rle) == 0) {
-                    if (current_idx_rle == 0 || current_idx_rle > 4) {
-                        // register_chain_item(idx);
+                    if (current_idx_rle == 0 || current_idx_rle >= 8) {
+                        register_chain_item(idx);
                         // if (current_idx_rle >= 8)
                         //     std::cout << "RLE: " << std::string_view((const char*)idx-current_idx_rle, std::min(16, current_idx_rle) ) << "/" <<  current_idx_rle << std::endl;
                     }
@@ -93,6 +93,7 @@ class TokenSearcher {
     const uint8_t* ip;
     const uint8_t* idx;
     const uint8_t* emitp;
+    const uint8_t* badp;
     Put_function put;
 
     struct Best{
@@ -109,6 +110,29 @@ class TokenSearcher {
         auto test_ofs() const {
             return std::distance( ofs+len , ip2);
         }
+        auto test_short() const {
+            return test_ofs() < (1<<10);
+        }
+
+        size_t intersect_len(const uint8_t* first1, const uint8_t* last1,
+            const uint8_t* first2, const uint8_t* last2) const {
+            // Находим потенциальное начало пересечения
+            // Это наибольший из двух начальных указателей
+            const uint8_t* intersection_first = std::max(first1, first2);
+
+            // Находим потенциальный конец пересечения
+            // Это наименьший из двух конечных указателей
+            const uint8_t* intersection_last = std::min(last1, last2);
+
+            // Если начало пересечения меньше конца, значит пересечение существует
+            if (intersection_first < intersection_last) {
+                return std::distance(intersection_first, intersection_last);
+            } else {
+                // В противном случае пересечения нет, возвращаем (last1, last1)
+                return 0;
+            }
+        }
+
         void optimize(const TokenSearcher& ctx) {
 
             if (len < ENCODE_MIN || test_ofs() > MAX_OFFSET) {
@@ -122,19 +146,26 @@ class TokenSearcher {
                 len = 0;
                 return;
             }
-            int thelen = len;
 
             auto literal_len = std::distance(ctx.emitp,ip2);
-            auto literal_match_part = std::distance(ofs+len,ctx.emitp);
-            if (literal_match_part < 0) {
-                thelen += literal_match_part;
-            }
+            auto effective_len = len - intersect_len(ofs,ofs+len,ctx.emitp,ip2);
+            assert(effective_len >= 0);
 
-            if (test_ofs() < (1<<10) && literal_len <= 3) {
-                gain = literal_len +  2 + match_cost(len) - thelen;
-                return;
-            }
-            gain = literal_len + 3 + literal_cost(literal_len) + match_cost(len) - thelen;
+            // if (test_short() && literal_len <= 3) {
+            //     gain = literal_len +  2 + match_cost(len) - std::max(0,thelen);
+            //     return;
+            // }
+            // gain = literal_len + 3 + literal_cost(literal_len) + match_cost(len) - std::max(0,thelen);
+
+            int cost;
+            if (test_short() && literal_len <= 3) {
+                cost =  2 + match_cost(len);
+            } else
+                cost = 3 + literal_cost(literal_len) + match_cost(len);
+
+            //gain = literal_len + cost - effective_len;
+            gain = literal_len + cost - effective_len;
+
         }
 
 
@@ -162,19 +193,19 @@ class TokenSearcher {
         #endif
     }
 
-
     public:
-    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idx(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,CHAIN_BREAK), chain(CHAIN_SIZE,ChainItem{})   {}
+    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), badp(begin), idx(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,CHAIN_BREAK), chain(CHAIN_SIZE,ChainItem{}) {}
 
 
     void emit(const Best & best) {
+
         assert(best.ip2 >= emitp);
         if (best.len < ENCODE_MIN) {
             emit(); //emit as literal
             return;
         }
         put(best.test_ofs(), best.len, emitp, best.ip2 - emitp);
-        emitp = ip = best.ip2 + best.len;
+        badp = emitp = ip = best.ip2 + best.len;
     }
 
     void emit() {
@@ -185,12 +216,16 @@ class TokenSearcher {
         }
     }
 
+
+
     void compressor() {
 
         ip+=ENCODE_MIN;
+        int penalty = 1;
         if (ip > data_end) {
             ip = data_end;
         };
+
 
         for (;;)
         {
@@ -198,11 +233,31 @@ class TokenSearcher {
                 emit();
                 break;
             }
-            auto match = search_best(ip);
+            auto match = search_best(ip,nullptr,false);
             if (match.len < ENCODE_MIN) {
                 ip++;
                 continue;
             }
+
+            if (match.gain  > penalty )  {
+                ip += 1;
+                penalty = match.gain+2;
+                continue;
+            }
+
+            penalty = 0;
+
+                // if ( std::distance(emitp, match.ip2) <= 3)
+                //     std::cerr << "short_ok: " <<  std::distance(emitp, match.ip2) << " gain: " << match.gain << " len: " << match.len << std::endl;
+                // else {
+
+                //     std::cerr << "short_xx: " <<  std::distance(emitp, match.ip2) << " gain: " << match.gain << " len: " << match.len << std::endl;
+                // }
+
+            // if (match.is_self_reference(*this)) {
+            //     std::cerr << "self reference : " <<  std::distance(match.ip2,emitp) <<  std::endl;
+            // }
+
             emit(match);
         }
 
@@ -271,6 +326,7 @@ class TokenSearcher {
 
             if (after.gain < best.gain) {
                 best = after;
+                //std::cerr << " gain search step: " << (best.gain - after.gain) << std::endl;
                 if ( first_short_match && best.test_ofs() < (1<<10) ) {
                     break;
                 }
