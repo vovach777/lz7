@@ -116,14 +116,19 @@ class TokenSearcher {
                 len = 0;
                 return;
             }
+            int thelen = len;
 
             auto literal_len = std::distance(ctx.emitp,ip2);
+            auto literal_match_part = std::distance(ofs+len,ctx.emitp);
+            if (literal_match_part < 0) {
+                thelen += literal_match_part;
+            }
 
             if (test_ofs() < (1<<10) && literal_len <= 3) {
-                gain = literal_len +  2 + match_cost(len) - len;
+                gain = literal_len +  2 + match_cost(len) - thelen;
                 return;
             }
-            gain = literal_len + 3 + literal_cost(literal_len) + match_cost(len) - len;
+            gain = literal_len + 3 + literal_cost(literal_len) + match_cost(len) - thelen;
         }
 
 
