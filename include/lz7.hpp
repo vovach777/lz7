@@ -4,7 +4,7 @@
 #define HAS_BUILTIN_CLZ
 #define MAX_OFFSET ((1 << 17)-1)
 #define NO_MATCH_OFS (MAX_OFFSET)
-#define ENCODE_MIN (3)
+#define ENCODE_MIN (4)
 #define MAX_FALSE_SEQUENCE_COUNT (32)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
@@ -91,7 +91,6 @@ class TokenSearcher {
     const uint8_t* ip;
     const uint8_t* idx;
     const uint8_t* emitp;
-    const uint8_t* badp;
     Put_function put;
 
     struct Best{
@@ -131,32 +130,25 @@ class TokenSearcher {
             }
         }
 
+        void set_to_literals(const TokenSearcher& ctx) {
+             auto literal_len = std::distance(ctx.emitp,ip2);
+             len = 0;
+             gain = -2 /*cost*/ - literal_len - (literal_len + 255 - 31) / 255;
+        }
         void optimize(const TokenSearcher& ctx) {
 
             if (len < ENCODE_MIN || test_ofs() > MAX_OFFSET) {
-                len = 0;
+                set_to_literals(ctx);
                 return;
             }
             assert(test_ofs() != 0);
+            auto literal_len = std::distance(ctx.emitp,ip2);
             // euristic optimization
-
-            auto literal_len = std::distance(ctx.badp,ip2);
-            //auto effective_len = len - intersect_len(ofs,ofs+len,ctx.emitp,ip2);
-            //assert(effective_len >= 0);
-
-            // if (test_short() && literal_len <= 3) {
-            //     gain = literal_len +  2 + match_cost(len) - std::max(0,thelen);
-            //     return;
-            // }
-            // gain = literal_len + 3 + literal_cost(literal_len) + match_cost(len) - std::max(0,thelen);
-
             int cost;
             if (test_short() && literal_len <= 3) {
                 cost =  2 + match_cost(len);
             } else
                 cost = 3 + literal_cost(literal_len) + match_cost(len);
-
-            //gain = literal_len + cost - effective_len;
             gain = len - cost - literal_len;
 
         }
@@ -183,7 +175,7 @@ class TokenSearcher {
     }
 
     public:
-    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), badp(begin), idx(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,CHAIN_BREAK), chain(CHAIN_SIZE,ChainItem{}) {}
+    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idx(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,CHAIN_BREAK), chain(CHAIN_SIZE,ChainItem{}) {}
 
 
     void emit(const Best & best) {
@@ -194,7 +186,7 @@ class TokenSearcher {
             return;
         }
         put(best.test_ofs(), best.len, emitp, best.ip2 - emitp);
-        badp = emitp = ip = best.ip2 + best.len;
+        emitp = ip = best.ip2 + best.len;
     }
 
     void emit() {
@@ -236,25 +228,6 @@ class TokenSearcher {
                 }
                 ip += 1;
             }
-
-
-                // if ( std::distance(emitp, match.ip2) <= 3)
-                //     std::cerr << "short_ok: " <<  std::distance(emitp, match.ip2) << " gain: " << match.gain << " len: " << match.len << std::endl;
-                // else {
-
-                //     std::cerr << "short_xx: " <<  std::distance(emitp, match.ip2) << " gain: " << match.gain << " len: " << match.len << std::endl;
-                // }
-
-            // if (match.is_self_reference(*this)) {
-            //     std::cerr << "self reference : " <<  std::distance(match.ip2,emitp) <<  std::endl;
-            // })
-            // if (std::distance(emitp, match.ip2) >= match.len && match.gain < 0) {
-       
-            //     badp += std::distance(emitp, match.ip2) + match.len;
-            //     ip = match.ip2  + 1;
-            //     //std::cerr << " gain < 0 => as literal" << std::endl;
-            //     continue;
-            // }
 
             emit(match);
         }
@@ -303,11 +276,9 @@ class TokenSearcher {
             if (match_len < ENCODE_MIN) {
                 continue;
             }
-            if (it_mismatch > ip) {
-              //  std::cerr << "self-ref: " <<  it_mismatch-ip <<   std::endl;
-            }
-
-            //assert( match < MAX_MATCH);
+            // if (it_mismatch > ip) {
+            //   //  std::cerr << "self-ref: " <<  it_mismatch-ip <<   std::endl;
+            // }
             //back matching
             auto ip2 = ip;
 
