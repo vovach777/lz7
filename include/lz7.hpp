@@ -47,6 +47,7 @@ class TokenSearcher {
     uint16_t next_override_item{0};
 
     void register_chain_item(const uint8_t* idx) {
+        if (idx+ENCODE_MIN>=data_end) return;
         uint16_t id = next_override_item;
         if (id+1 == CHAIN_BREAK)
             next_override_item = 0; //round
@@ -67,25 +68,21 @@ class TokenSearcher {
     }
     int current_idx_rle = 0;
     void index(const uint8_t* ip) {
-
-        while (idx+ENCODE_MIN <= ip) {
-            if ( idx[0] == idx[+1]) {
-                if ( ((current_idx_rle -1) & current_idx_rle) == 0) {
+        while (idx < ip) {
+            if (idx[0] == idx[1]) {
+                if (((current_idx_rle - 1) & current_idx_rle) == 0) {
                     if (current_idx_rle == 0 || current_idx_rle >= 8) {
                         register_chain_item(idx);
                         // if (current_idx_rle >= 8)
                         //     std::cout << "RLE: " << std::string_view((const char*)idx-current_idx_rle, std::min(16, current_idx_rle) ) << "/" <<  current_idx_rle << std::endl;
                     }
                 }
-                current_idx_rle += 1;
-
+                current_idx_rle++;
             } else {
-
                 register_chain_item(idx);
                 current_idx_rle = 0;
-
             }
-            idx += 1;
+            idx++;
         }
     }
 
@@ -140,13 +137,8 @@ class TokenSearcher {
                 len = 0;
                 return;
             }
+            assert(test_ofs() != 0);
             // euristic optimization
-
-            if (len == ENCODE_MIN && test_ofs() == (MAX_OFFSET)) {
-                //you ara lucky guys
-                len = 0;
-                return;
-            }
 
             auto literal_len = std::distance(ctx.badp,ip2);
             //auto effective_len = len - intersect_len(ofs,ofs+len,ctx.emitp,ip2);
@@ -182,10 +174,6 @@ class TokenSearcher {
 
     };
 
-    // inline auto compare(const uint8_t* it1, const uint8_t* it2) const {
-    //     auto [a,b] = std::mismatch(it1, data_end,  it2, it1);
-    //     return std::distance(it1,a);
-    // }
     uint16_t hash_of(const uint8_t* it) const {
         #if ENCODE_MIN == 3
         return static_cast<uint16_t>( (reinterpret_cast<const uint32_t*>(it)[0]&0xffffff) * 2654435761u >> (32-HASH_LOG2) );
@@ -212,17 +200,13 @@ class TokenSearcher {
     void emit() {
         assert(ip >= emitp);
         if (ip > emitp) {
-            put(NO_MATCH_OFS, ENCODE_MIN, emitp, ip - emitp);
+            put(0, 0, emitp, ip - emitp);
             emitp = ip;
         }
     }
 
-
-
     void compressor() {
-
-        ip+=ENCODE_MIN;
-        int penalty = 1;
+        ip+=1;
         if (ip > data_end) {
             ip = data_end;
         };
@@ -243,18 +227,16 @@ class TokenSearcher {
 
             for (int i = 1; i <= LOOK_AHEAD; ++i)
             {
-                auto next_match = search_best(ip,nullptr,false);
-                if (next_match.gain > match.gain) {
-                    match = next_match;
+                if (ip + ENCODE_MIN > data_end) break;
+                if (std::memcmp(ip-1, ip, ENCODE_MIN) != 0) {
+                    auto next_match = search_best(ip,nullptr,false);
+                    if (next_match.gain > match.gain) {
+                        match = next_match;
+                    }              
                 }
                 ip += 1;
             }
 
-            // if (match.gain  > 32 )  {
-            //     ip += match.len;
-            //     badp = ip;
-            //     continue;
-            // }
 
                 // if ( std::distance(emitp, match.ip2) <= 3)
                 //     std::cerr << "short_ok: " <<  std::distance(emitp, match.ip2) << " gain: " << match.gain << " len: " << match.len << std::endl;
@@ -266,6 +248,13 @@ class TokenSearcher {
             // if (match.is_self_reference(*this)) {
             //     std::cerr << "self reference : " <<  std::distance(match.ip2,emitp) <<  std::endl;
             // })
+            // if (std::distance(emitp, match.ip2) >= match.len && match.gain < 0) {
+       
+            //     badp += std::distance(emitp, match.ip2) + match.len;
+            //     ip = match.ip2  + 1;
+            //     //std::cerr << " gain < 0 => as literal" << std::endl;
+            //     continue;
+            // }
 
             emit(match);
         }
@@ -299,7 +288,7 @@ class TokenSearcher {
 
             //pre-hashing happens...
             //fast skip
-            if (it+ENCODE_MIN > ip) {
+            if (it >= ip) {
                 false_sequence_count = 0;
                 continue;
             }
@@ -309,11 +298,9 @@ class TokenSearcher {
                 continue;
             }
 
-            auto ip_lim = std::min(ip+MAX_LEN, data_end);
-
             auto [ it_mismatch, ip_mismatch ] = std::mismatch(it, data_end, ip, data_end);
-            int match = std::distance(it, it_mismatch);
-            if (match < ENCODE_MIN) {
+            int match_len = std::distance(it, it_mismatch);
+            if (match_len < ENCODE_MIN) {
                 continue;
             }
             if (it_mismatch > ip) {
@@ -324,16 +311,15 @@ class TokenSearcher {
             //back matching
             auto ip2 = ip;
 
-            while ( match < MAX_MATCH && ip2 > emitp  &&  it[-1] == ip2[-1] ) {
+            while (  it > data_begin  &&  ip2 > emitp  &&  it[-1] == ip2[-1] ) {
                 --it;
                 --ip2;
-                //if (it + match != ip2)
-                    ++match;
+                ++match_len;
             }
             assert(ip2 >= emitp);
             //assert(it + match <= ip2);
 
-            Best after{it, ip2, match };
+            Best after{it, ip2, match_len };
             after.optimize(*this);
 
             if (after.gain > best.gain) {

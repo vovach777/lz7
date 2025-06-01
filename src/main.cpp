@@ -23,12 +23,31 @@ int main(int argc, char** argv) {
 
     lz_comp(data.data(), data.data()+data.size(),[&](int offset, int len, const uint8_t * literals, int literals_len ) {
 
-            assert(offset >= 0);
+            if (offset == 0) {
+                assert(len == 0);
+                out.push_back(0x80 | std::min(literals_len, 31));
+                out.push_back(0);
+                if (literals_len-31 >= 0) {
+                    //offset_10 not pass here
+                    for (int ext255=0;;)
+                    {
+                        auto chunk = std::min(literals_len-31-ext255*255,255);
+                        out.push_back( chunk );
+                        if (chunk < 255) break;  
+                        ext255++;
+                    }
+                }
+                for (int i = 0; i < literals_len; ++i) {
+                    out.push_back(literals[i]);
+                }
+                return;
+            }
+            assert(offset > 0);
             assert(len >= 0);
             assert(literals_len >= 0);
 
         
-           
+            //1_00_LL_LLL 0000_0000
 
             //out.push_back( (std::min(len-ENCODE_MIN,15))  | std::min(literals_len,15) << 4 );
             //1_xx_LL_MMM xxxx_xxxx 
