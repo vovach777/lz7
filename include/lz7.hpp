@@ -13,6 +13,7 @@
 #define CHAIN_LOG2 (16)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
+#define LOOK_AHEAD (2)
 #if CHAIN_LOG2 > 16
 #error "CHAIN_LOG2 > chain is uint16_t only"
 #endif
@@ -100,7 +101,7 @@ class TokenSearcher {
         const uint8_t* ofs{};
         const uint8_t* ip2{};
         int len{};
-        int gain{MAX_OFFSET};
+        int gain{std::numeric_limits<int>::min()};
         bool is_self_reference(const TokenSearcher& ctx) const {
             return ofs + len > ctx.emitp;
         }
@@ -108,7 +109,7 @@ class TokenSearcher {
             return std::max<ptrdiff_t>(0, (ofs+len) - ctx.emitp);
         }
         auto test_ofs() const {
-            return std::distance( ofs+len , ip2);
+            return std::distance( ofs , ip2);
         }
         auto test_short() const {
             return test_ofs() < (1<<10);
@@ -147,9 +148,9 @@ class TokenSearcher {
                 return;
             }
 
-            auto literal_len = std::distance(ctx.emitp,ip2);
-            auto effective_len = len - intersect_len(ofs,ofs+len,ctx.emitp,ip2);
-            assert(effective_len >= 0);
+            auto literal_len = std::distance(ctx.badp,ip2);
+            //auto effective_len = len - intersect_len(ofs,ofs+len,ctx.emitp,ip2);
+            //assert(effective_len >= 0);
 
             // if (test_short() && literal_len <= 3) {
             //     gain = literal_len +  2 + match_cost(len) - std::max(0,thelen);
@@ -164,7 +165,7 @@ class TokenSearcher {
                 cost = 3 + literal_cost(literal_len) + match_cost(len);
 
             //gain = literal_len + cost - effective_len;
-            gain = literal_len + cost - effective_len;
+            gain = len - cost - literal_len;
 
         }
 
@@ -238,14 +239,22 @@ class TokenSearcher {
                 ip++;
                 continue;
             }
+            ip += 1;
 
-            if (match.gain  > penalty )  {
+            for (int i = 1; i <= LOOK_AHEAD; ++i)
+            {
+                auto next_match = search_best(ip,nullptr,false);
+                if (next_match.gain > match.gain) {
+                    match = next_match;
+                }
                 ip += 1;
-                penalty = match.gain+2;
-                continue;
             }
 
-            penalty = 0;
+            // if (match.gain  > 32 )  {
+            //     ip += match.len;
+            //     badp = ip;
+            //     continue;
+            // }
 
                 // if ( std::distance(emitp, match.ip2) <= 3)
                 //     std::cerr << "short_ok: " <<  std::distance(emitp, match.ip2) << " gain: " << match.gain << " len: " << match.len << std::endl;
@@ -256,7 +265,7 @@ class TokenSearcher {
 
             // if (match.is_self_reference(*this)) {
             //     std::cerr << "self reference : " <<  std::distance(match.ip2,emitp) <<  std::endl;
-            // }
+            // })
 
             emit(match);
         }
@@ -302,29 +311,32 @@ class TokenSearcher {
 
             auto ip_lim = std::min(ip+MAX_LEN, data_end);
 
-            auto [ it_mismatch, ip_mismatch ] = std::mismatch(it, ip, ip, ip_lim);
+            auto [ it_mismatch, ip_mismatch ] = std::mismatch(it, data_end, ip, data_end);
             int match = std::distance(it, it_mismatch);
             if (match < ENCODE_MIN) {
                 continue;
             }
+            if (it_mismatch > ip) {
+              //  std::cerr << "self-ref: " <<  it_mismatch-ip <<   std::endl;
+            }
 
-            assert( match < MAX_MATCH);
+            //assert( match < MAX_MATCH);
             //back matching
             auto ip2 = ip;
 
             while ( match < MAX_MATCH && ip2 > emitp  &&  it[-1] == ip2[-1] ) {
                 --it;
                 --ip2;
-                if (it + match != ip2)
+                //if (it + match != ip2)
                     ++match;
             }
             assert(ip2 >= emitp);
-            assert(it + match <= ip2);
+            //assert(it + match <= ip2);
 
             Best after{it, ip2, match };
             after.optimize(*this);
 
-            if (after.gain < best.gain) {
+            if (after.gain > best.gain) {
                 best = after;
                 //std::cerr << " gain search step: " << (best.gain - after.gain) << std::endl;
                 if ( first_short_match && best.test_ofs() < (1<<10) ) {
