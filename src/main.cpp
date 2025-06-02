@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <functional>
 #include "lz7.hpp"
+#include "mio.hpp"
+#include "profiling.hpp"
 
 
 int main(int argc, char** argv) {
@@ -14,14 +16,23 @@ int main(int argc, char** argv) {
          return 1;
     }
     const char* filename = argv[1];
-    std::ifstream instream(filename, std::ios::in | std::ios::binary);
-    std::vector<uint8_t> data((std::istreambuf_iterator<char>(instream)), std::istreambuf_iterator<char>());
+    // std::ifstream instream(filename, std::ios::in | std::ios::binary);
+    // std::vector<uint8_t> data((std::istreambuf_iterator<char>(instream)), std::istreambuf_iterator<char>());
+    std::error_code error;
+    auto mmap = mio::make_mmap<mio::ummap_source>(filename, 0, 0, error);
+    if (error)
+    {
+        std::cerr << error.message() << std::endl;
+        return 1;
+    }
+
     std::vector<uint8_t> out;
-    out.reserve(data.size() / 2);
+    out.reserve(mmap.size() / 2);
 
 
-
-    lz_comp(data.data(), data.data()+data.size(),[&](int offset, int len, const uint8_t * literals, int literals_len ) {
+    profiling::StopWatch sw;
+    sw.start();
+    lz_comp(mmap.data(), mmap.data()+mmap.size(),[&](int offset, int len, const uint8_t * literals, int literals_len ) {
 
             if (offset == 0) {
                 assert(len == 0);
@@ -33,7 +44,7 @@ int main(int argc, char** argv) {
                     {
                         auto chunk = std::min(literals_len-31-ext255*255,255);
                         out.push_back( chunk );
-                        if (chunk < 255) break;  
+                        if (chunk < 255) break;
                         ext255++;
                     }
                 }
@@ -46,11 +57,11 @@ int main(int argc, char** argv) {
             assert(len >= 0);
             assert(literals_len >= 0);
 
-        
+
             //1_00_LL_LLL 0000_0000
 
             //out.push_back( (std::min(len-ENCODE_MIN,15))  | std::min(literals_len,15) << 4 );
-            //1_xx_LL_MMM xxxx_xxxx 
+            //1_xx_LL_MMM xxxx_xxxx
             bool offset_10 = false;
             if (offset < (1 << 10) && literals_len < 4 ) {
                 offset_10 = true;
@@ -66,7 +77,7 @@ int main(int argc, char** argv) {
                 {
                     auto chunk = std::min(literals_len-7-ext255*255,255);
                     out.push_back( chunk );
-                    if (chunk < 255) break;  
+                    if (chunk < 255) break;
                     ext255++;
                 }
             }
@@ -77,24 +88,28 @@ int main(int argc, char** argv) {
             //assert(offset < 65536);
             out.push_back( offset & 0xff );
             if (!offset_10) {
-                out.push_back( (offset >> 8) & 0xff );         
-            } 
-        
+                out.push_back( (offset >> 8) & 0xff );
+            }
+
 
             if (len-ENCODE_MIN-7 >= 0) {
-                
+
                 for (int ext255=0;;)
                 {
                     auto chunk = std::min(len-ENCODE_MIN-7-ext255*255,255);
                     out.push_back( chunk );
-                    if (chunk < 255) break;  
+                    if (chunk < 255) break;
                     ext255++;
                 }
             }
 
      });
-     std::cout << data.size() << " -> " << out.size() << std::fixed << std::setprecision(2) << " (" << (out.size() * 100. / data.size()) << "%)" << std::endl;
-     
+     sw.stop();
+
+     std::cout << mmap.size() << " -> " << out.size() << std::fixed << std::setprecision(2) << " (" << (out.size() * 100. / mmap.size()) << "%)" << std::endl;
+     std::cout << "time: " << sw.elapsed_str() << std::endl;
+     std::cout << "speed: " << std::fixed << std::setprecision(2) <<  mmap.size() / sw.elapsed() / 1024 / 1024 << " MB/s" << std::endl;
+
      std::ofstream outstream(std::string(filename) + ".lz7", std::ios::out | std::ios::binary);
      if (outstream)
         outstream.write((char*)out.data(), out.size());
