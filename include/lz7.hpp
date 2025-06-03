@@ -5,9 +5,9 @@
 #define _USE_SIMD
 #define MAX_OFFSET ((1 << 17)-1)
 #define NO_MATCH_OFS (MAX_OFFSET)
-#define ENCODE_MIN (4)
-#define MAX_MATCHES_SCAN (2048)
-#define MAX_ITER_SCAN (10)
+#define ENCODE_MIN (3)
+#define MAX_MATCHES_SCAN (4096)
+#define MAX_ITER_SCAN (3)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
 #define HASH_LOG2 (16)
@@ -15,7 +15,7 @@
 #define CHAIN_LOG2 (16)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
-#define LOOK_AHEAD (2)
+#define LOOK_AHEAD (0)
 #if CHAIN_LOG2 > 16
 #error "CHAIN_LOG2 > chain is uint16_t only"
 #endif
@@ -334,6 +334,8 @@ class TokenSearcher {
 
         for (;;)
         {
+
+
             if (id == CHAIN_BREAK) {
                 break;
             }
@@ -407,10 +409,10 @@ class TokenSearcher {
                     break;
                 }
             }
+
             iter++;
             if (matches_total > MAX_MATCHES_SCAN ||  iter > MAX_ITER_SCAN)
                 break;
-
 
         }
     return best;
