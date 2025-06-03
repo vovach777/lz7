@@ -5,17 +5,18 @@
 #define _USE_SIMD
 #define MAX_OFFSET ((1 << 17)-1)
 #define NO_MATCH_OFS (MAX_OFFSET)
-#define ENCODE_MIN (3)
-#define MAX_MATCHES_SCAN (4096)
-#define MAX_ITER_SCAN (3)
+#define ENCODE_MIN (4)
+#define MAX_MATCHES_SCAN (0x8000)
+#define MAX_ITER_SCAN (16)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
-#define HASH_LOG2 (16)
+#define HASH_LOG2 (17)
 #define HASH_SIZE (1 << HASH_LOG2)
 #define CHAIN_LOG2 (16)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
 #define LOOK_AHEAD (0)
+#define RLE_INDEX_TRIGGER 20
 #if CHAIN_LOG2 > 16
 #error "CHAIN_LOG2 > chain is uint16_t only"
 #endif
@@ -39,65 +40,81 @@
 #include <immintrin.h>
 
 using Put_function = std::function<void(int offset, int len, const uint8_t * literals, int literals_len )>;
+
+inline bool is_rle(const uint8_t* r) {
+
+    return std::memcmp(r, r+1, ENCODE_MIN-1) == 0;
+
+}
+
 class TokenSearcher {
+    struct HashItem
+    {
+        const uint8_t* idx{nullptr};
+        uint16_t next_item{CHAIN_BREAK};
+        //uint16_t offset_relative{0}; //is allways 0. idx = idx-0;
+    };
     struct ChainItem
     {
-        const uint8_t* pos{nullptr};
-        uint16_t next{CHAIN_BREAK};
-        uint16_t hash{};
+        uint16_t next_item{CHAIN_BREAK};
+        uint16_t offset_relative{0xFFFF};
     };
 
-    std::vector<uint16_t> hashtabele; //index to chain
-    std::vector<ChainItem> chain;
+    std::vector<HashItem> hashtabele; //index to chain
+    std::vector<ChainItem> chaintable;
     uint16_t next_override_item{0};
 
     void register_chain_item(const uint8_t* idx) {
         if (idx+ENCODE_MIN>=data_end) return;
+        auto hash = hash_of(idx);
+        //в хэш-таблице ссылка на следующий элемент в цепочке. там находится размется между текущем смещением и текущим.
+        auto& hash_item = hashtabele[hash];
+        if (hash_item.idx == nullptr) {
+            hash_item.idx = idx;
+            hash_item.next_item = CHAIN_BREAK;
+            return;
+        }
+        if ( hash_item.idx >= idx ) {
+            return;
+        }
         uint16_t id = next_override_item;
         if (id+1 == CHAIN_BREAK)
             next_override_item = 0; //round
         else
             next_override_item = id+1;
 
-        ChainItem& item = chain[id];
-        //not empty item
-        if (item.pos != nullptr)  {
-            if (hashtabele[item.hash] == id)
-                hashtabele[item.hash] = CHAIN_BREAK; //unregister
-        }
-        //clear
-        item.pos = idx;
-        item.hash = hash_of(idx);
-        item.next = hashtabele[item.hash];
-        hashtabele[item.hash] = id;
+        auto& chain_item = chaintable[id];
+        chain_item.next_item = hash_item.next_item;
+        chain_item.offset_relative = std::min<ptrdiff_t>(0xFFFF, idx - hash_item.idx);
+        hash_item.idx = idx;
+        hash_item.next_item = id;
     }
+
 
 
     int current_idx_rle = 0;
     size_t matches_total = 0;
-    void index(const uint8_t* ip) {
-        while (idx < ip) {
-            if (idx[0] == idx[1]) {
-                if (((current_idx_rle - 1) & current_idx_rle) == 0) {
-                    if (current_idx_rle == 0 || current_idx_rle >= 8) {
-                        register_chain_item(idx);
-                        // if (current_idx_rle >= 8)
-                        //     std::cout << "RLE: " << std::string_view((const char*)idx-current_idx_rle, std::min(16, current_idx_rle) ) << "/" <<  current_idx_rle << std::endl;
-                    }
-                }
-                current_idx_rle++;
-            } else {
-                register_chain_item(idx);
-                current_idx_rle = 0;
+    void index() {
+
+        while (idxp < ip) {
+            if (delayed_register != nullptr && delayed_register < ip) {
+                register_chain_item(delayed_register);
+                delayed_register = nullptr;
             }
-            idx++;
+            if (is_rle(idxp)) {
+                //std::cerr << "RLE-skip-index: " << std::string_view((const char*)idxp, ENCODE_MIN) <<  std::endl;
+                idxp += match_len_simd(idxp, idxp + 1, data_end) + 1;
+            } else {
+                register_chain_item(idxp);
+                idxp++;
+            }
         }
     }
 
     const uint8_t* data_begin;
     const uint8_t* data_end;
     const uint8_t* ip;
-    const uint8_t* idx;
+    const uint8_t* idxp;
     const uint8_t* emitp;
     Put_function put;
 
@@ -183,7 +200,7 @@ class TokenSearcher {
     }
 
     public:
-    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idx(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,CHAIN_BREAK), chain(CHAIN_SIZE,ChainItem{}) {}
+    TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,HashItem{}), chaintable(CHAIN_SIZE,ChainItem{}) {}
 
 
     void emit(const Best & best) {
@@ -205,15 +222,6 @@ class TokenSearcher {
         }
     }
 
-    inline bool is_rle(const uint8_t* p) {
-        auto v = p[0];
-        #if ENCODE_MIN == 3
-            return p[1] == v && p[2] == v && p[3] == v;
-        #else
-            return p[1] == v && p[2] == v && p[3] == v && p[4] == v;
-        #endif
-    }
-
 
     void compress() {
         ip+=1;
@@ -222,19 +230,39 @@ class TokenSearcher {
         };
 
 
+        //const uint8_t * is_rle_optimizaion{nullptr};
         for (;;)
         {
             if (ip + ENCODE_MIN > data_end){
+                // if (is_rle_optimizaion != nullptr) {
+                //     Best rle{is_rle_optimizaion, std::distance(is_rle_optimizaion, ip)};
+                //     rle.optimize(*this);
+                //     emit(rle);
+                // }
                 emit();
                 break;
             }
+            // if (is_rle(ip)) {
+            //     // if (is_rle_optimizaion == nullptr) {
+            //     //     is_rle_optimizaion = ip;
+            //     // }
+            //     // ip += ENCODE_MIN-1;
+            //     // continue;
+            //     index(ip);
+            //     ip += match_len_simd(ip, ip + 1, data_end) + 1 - ENCODE_MIN;
+            //     idx = ip + ENCODE_MIN;
+            // }
+            // if (is_rle_optimizaion) {
+            //     std::cerr << "rle-optimizaion" << std::endl;
+            // }
+            // is_rle_optimizaion = nullptr;
             matches_total = 0;
-            auto match = search_best(ip,nullptr,false);
+            auto match = search_best(nullptr,false);
             if (match.len < ENCODE_MIN) {
                 ip++;
                 continue;
             }
-
+#if LOOK_AHEAD > 0
             std::unordered_set<uint16_t> candidates{hash_of(ip)};
             ip++;
 #if 1
@@ -266,6 +294,7 @@ class TokenSearcher {
                     //break;
                 }
             }
+#endif
             emit(match);
         }
 
@@ -324,67 +353,80 @@ class TokenSearcher {
     }
     #endif
 
-    Best search_best( const uint8_t* ip, const uint8_t* fast_skip=nullptr, bool first_short_match=false) {
+    const uint8_t* delayed_register{nullptr};
+
+    Best search_best(const uint8_t* fast_skip=nullptr, bool first_short_match=false) {
         Best best{};
-        auto chain_breaker = hash_of(ip);
-        auto prev_pos = data_end;
-        index(ip);
-        auto id = hashtabele[chain_breaker];
-        int iter = 0;
+        uint16_t hash;
+        const uint8_t* idx;
+        int next_item;
 
-        for (;;)
+        index();
+
+        if (is_rle(ip)) {
+            best.len = match_len_simd(ip, ip + 1, data_end);
+            best.ofs = ip-1;
+            if (best.len+1 >= RLE_INDEX_TRIGGER) {
+                delayed_register = best.ofs;
+                //std::cerr << "RLE register: " << best.len+1 << std::endl;
+            }
+            best.ip2 = ip;
+            best.optimize(*this);
+            if (idxp < best.ip2 + best.len)
+                idxp = best.ip2 + best.len;
+
+        }
+
+
+
+
+        for (int nbAttempts=0; nbAttempts != MAX_ITER_SCAN; nbAttempts++)
         {
-
-
-            if (id == CHAIN_BREAK) {
-                break;
+            if (nbAttempts == 0) {
+                hash = hash_of(ip);
+                auto  & hash_item = hashtabele[hash];
+                idx = hash_item.idx;
+                if (idx == nullptr)
+                    break;
+                next_item = hash_item.next_item;
+            } else {
+                if (next_item == CHAIN_BREAK)
+                    break;
+                auto  & chain_item = chaintable[next_item];
+                // if ( chain_item.offset_relative == 0xFFFF) {
+                //     break;
+                // }
+                idx -= chain_item.offset_relative;
+                if (idx < data_begin)
+                    break;
+                if (hash_of(idx) != hash)
+                    break;
+                next_item = chain_item.next_item;
             }
-            const auto &item = chain[id];
-            id = item.next;
-            auto it = item.pos;
-            assert(it != nullptr);
-
-            if (item.hash != chain_breaker) {
-                break;
-            }
-
-            if (it >= prev_pos) {
-                //std::cerr << "break by pos!" << std::endl;
-                break;
-            }
-            prev_pos = it;
-
-            if (std::distance(it,ip) > MAX_OFFSET+32) {
-                break;
-            }
-
             //pre-hashing happens...
             //fast skip
-            if (it >= ip) {
+            if (idx >= ip)
                 continue;
-            }
             //fast skip
-            if (fast_skip && it > fast_skip) {
+            if (fast_skip && idx > fast_skip)
                 continue;
-            }
 #ifdef _USE_SIMD
-            auto  match_len = match_len_simd(ip, it, data_end);
+            auto  match_len = match_len_simd(ip, idx, data_end);
             matches_total += match_len;
 #else
             auto [ it_mismatch, ip_mismatch ] = std::mismatch(it, data_end, ip, data_end);
             int match_len = std::distance(it, it_mismatch);
 #endif
 
-            if (match_len < ENCODE_MIN) {
+            if (match_len < ENCODE_MIN)
                 continue;
-            }
             // if (it_mismatch > ip) {
             //   //  std::cerr << "self-ref: " <<  it_mismatch-ip <<   std::endl;
             // }
 #ifdef _USE_SIMD
-            int back_match_len = match_len_simd_backward(data_begin, it-1, emitp,  ip-1);
+            int back_match_len = match_len_simd_backward(data_begin, idx-1, emitp,  ip-1);
             auto ip2 = ip - back_match_len;
-            it  -= back_match_len;
+            idx  -= back_match_len;
             match_len += back_match_len;
 #else
             //back matching
@@ -396,10 +438,10 @@ class TokenSearcher {
             }
 #endif
             assert(ip2 >= emitp);
-            assert(it >= data_begin);
+            assert(idx >= data_begin);
             //assert(it + match <= ip2);
 
-            Best after{it, ip2, match_len };
+            Best after{idx, ip2, match_len };
             after.optimize(*this);
 
             if (after.gain > best.gain) {
@@ -408,12 +450,21 @@ class TokenSearcher {
                 if ( first_short_match && best.test_ofs() < (1<<10) ) {
                     break;
                 }
+                // if (nbAttempts < 0) {
+                //     std::cerr << "RLE: " << std::string_view((const char*)best.ofs, std::min(16, best.len ) ) <<  std::endl;
+                //     break;
+                    //не продуманная индексация RLE
+                    // hash = hash_of(ip);
+                    // auto &hash_item = hashtabele[hash];
+                    // if ( hash_item.idx == nullptr )
+                    // {
+                    //     hash_item.idx = ip;
+                    //     hash_item.next_item = CHAIN_BREAK;
+                    //     break;
+
+                    // }
+                //}
             }
-
-            iter++;
-            if (matches_total > MAX_MATCHES_SCAN ||  iter > MAX_ITER_SCAN)
-                break;
-
         }
     return best;
     }

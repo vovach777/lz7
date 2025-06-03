@@ -20,6 +20,7 @@ int main(int argc, char** argv) {
     // std::vector<uint8_t> data((std::istreambuf_iterator<char>(instream)), std::istreambuf_iterator<char>());
     std::error_code error;
     auto mmap = mio::make_mmap<mio::ummap_source>(filename, 0, 0, error);
+
     if (error)
     {
         std::cerr << error.message() << std::endl;
@@ -31,8 +32,13 @@ int main(int argc, char** argv) {
 
 
     profiling::StopWatch sw;
+    std::cout << "loading file to memory..." << std::flush;
     sw.start();
-    lz_comp(mmap.data(), mmap.data()+mmap.size(),[&](int offset, int len, const uint8_t * literals, int literals_len ) {
+    std::vector<uint8_t> data(mmap.begin(), mmap.end());
+    sw.stop();
+    std::cout << " " << sw.elapsed_str() <<    std::endl;
+    sw.startnew();
+    lz_comp(data.data(), data.data()+data.size(),[&](int offset, int len, const uint8_t * literals, int literals_len ) {
 
             if (offset == 0) {
                 assert(len == 0);
@@ -106,9 +112,9 @@ int main(int argc, char** argv) {
      });
      sw.stop();
 
-     std::cout << mmap.size() << " -> " << out.size() << std::fixed << std::setprecision(2) << " (" << (out.size() * 100. / mmap.size()) << "%)" << std::endl;
+     std::cout << mmap.size() << " -> " << out.size() << std::fixed << std::setprecision(2) << " (" << (out.size() * 100. / data.size()) << "%)" << std::endl;
      std::cout << "time: " << sw.elapsed_str() << std::endl;
-     std::cout << "speed: " << std::fixed << std::setprecision(2) <<  mmap.size() / sw.elapsed() / 1024 / 1024 << " MB/s" << std::endl;
+     std::cout << "speed: " << std::fixed << std::setprecision(2) <<  data.size() / sw.elapsed() / 1024 / 1024 << " MB/s" << std::endl;
 
      std::ofstream outstream(std::string(filename) + ".lz7", std::ios::out | std::ios::binary);
      if (outstream)
