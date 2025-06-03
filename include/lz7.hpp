@@ -7,16 +7,16 @@
 #define NO_MATCH_OFS (MAX_OFFSET)
 #define ENCODE_MIN (4)
 #define MAX_MATCHES_SCAN (0x8000)
-#define MAX_ITER_SCAN (16)
+#define MAX_ITER_SCAN (12)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
-#define HASH_LOG2 (17)
+#define HASH_LOG2 (16)
 #define HASH_SIZE (1 << HASH_LOG2)
-#define CHAIN_LOG2 (16)
+#define CHAIN_LOG2 (15)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
 #define LOOK_AHEAD (0)
-#define RLE_INDEX_TRIGGER 20
+#define RLE_INDEX_TRIGGER 8
 #if CHAIN_LOG2 > 16
 #error "CHAIN_LOG2 > chain is uint16_t only"
 #endif
@@ -364,17 +364,21 @@ class TokenSearcher {
         index();
 
         if (is_rle(ip)) {
-            best.len = match_len_simd(ip, ip + 1, data_end);
-            best.ofs = ip-1;
-            if (best.len+1 >= RLE_INDEX_TRIGGER) {
+            int len = match_len_simd(ip+1, ip, data_end)+1;
+            int backlen = match_len_simd_backward(data_begin,ip-1,emitp, ip);
+            best.ofs = ip - backlen;
+            best.ip2 = ip - backlen + 1;
+            best.len = len + backlen - 1;
+            best.optimize(*this);
+
+            if (len + backlen >= RLE_INDEX_TRIGGER || (len + backlen >= ENCODE_MIN && hashtabele[hash_of(best.ofs)].idx == nullptr)) {
                 delayed_register = best.ofs;
                 //std::cerr << "RLE register: " << best.len+1 << std::endl;
+                //std::cerr << "RLE: " << std::string_view((const char*)best.ofs, len + backlen+1)  << std::endl;
             }
-            best.ip2 = ip;
-            best.optimize(*this);
-            if (idxp < best.ip2 + best.len)
-                idxp = best.ip2 + best.len;
-
+            //if (best.len >= ENCODE_MIN)
+            //    return best;
+          
         }
 
 
