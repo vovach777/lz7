@@ -7,12 +7,12 @@
 #define NO_MATCH_OFS (MAX_OFFSET)
 #define ENCODE_MIN (4)
 #define MAX_MATCHES_SCAN (0x8000)
-#define MAX_ITER_SCAN (12)
+#define MAX_ITER_SCAN (16)
 #define MAX_LEN (65535)
 #define MAX_MATCH (MAX_LEN+ENCODE_MIN)
 #define HASH_LOG2 (16)
 #define HASH_SIZE (1 << HASH_LOG2)
-#define CHAIN_LOG2 (15)
+#define CHAIN_LOG2 (16)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
 #define LOOK_AHEAD (0)
@@ -354,6 +354,7 @@ class TokenSearcher {
     #endif
 
     const uint8_t* delayed_register{nullptr};
+    inline bool no_collision(const uint8_t* idx) const { return hashtabele[hash_of(idx)].idx == nullptr; }
 
     Best search_best(const uint8_t* fast_skip=nullptr, bool first_short_match=false) {
         Best best{};
@@ -364,21 +365,22 @@ class TokenSearcher {
         index();
 
         if (is_rle(ip)) {
-            int len = match_len_simd(ip+1, ip, data_end)+1;
-            int backlen = match_len_simd_backward(data_begin,ip-1,emitp, ip);
-            best.ofs = ip - backlen;
-            best.ip2 = ip - backlen + 1;
-            best.len = len + backlen - 1;
+            auto len = match_len_simd(ip+1, ip, data_end)+1;
+            auto backlen = match_len_simd_backward(data_begin,ip-1,emitp, ip);
+            auto rle_len = len + backlen;
+            auto rle_ofs = ip - backlen;
+            //1: index this RLE if it is long enough or if there is no hash collision
+            if (rle_len >= RLE_INDEX_TRIGGER || (rle_len >= ENCODE_MIN && no_collision(rle_ofs))) {
+                assert( delayed_register == nullptr );
+                delayed_register = rle_ofs;
+            }
+
+            //2: create RLE match (self-reference match)
+            best.ofs = rle_ofs;
+            best.ip2 = rle_ofs + 1;
+            best.len = rle_len - 1;
             best.optimize(*this);
 
-            if (len + backlen >= RLE_INDEX_TRIGGER || (len + backlen >= ENCODE_MIN && hashtabele[hash_of(best.ofs)].idx == nullptr)) {
-                delayed_register = best.ofs;
-                //std::cerr << "RLE register: " << best.len+1 << std::endl;
-                //std::cerr << "RLE: " << std::string_view((const char*)best.ofs, len + backlen+1)  << std::endl;
-            }
-            //if (best.len >= ENCODE_MIN)
-            //    return best;
-          
         }
 
 
