@@ -4,6 +4,7 @@ project(LZ7Project)
 # Указываем версию C++ стандарта
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+add_compile_options(-mavx)
 
 # Добавляем директории для заголовочных файлов
 include_directories(include)
