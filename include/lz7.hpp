@@ -14,7 +14,7 @@
 #define CHAIN_LOG2 (16)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
-#define LOOK_AHEAD (3)
+#define LOOK_AHEAD (4)
 #define MICRO_HASH (8)
 #define RLE_INDEX_TRIGGER 8
 //#define _USE_NEXT_MATCH_OPTIMIZATION
@@ -294,7 +294,7 @@ class TokenSearcher {
 #endif
 
             //fast-skip
-            for (ip+=1; ip < emitp+LOOK_AHEAD; ip += 1)
+            for (ip+=1; ip <= emitp+LOOK_AHEAD; ip += 1)
             {
 #if MICRO_HASH > 0
                 const uint16_t hash = hash_of<MICRO_HASH>(ip);
