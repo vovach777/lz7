@@ -14,8 +14,8 @@
 #define CHAIN_LOG2 (16)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
-#define LOOK_AHEAD (4)
-#define MICRO_HASH (8)
+#define LOOK_AHEAD (2)
+#define MICRO_HASH (6)
 #define RLE_INDEX_TRIGGER 8
 //#define _USE_NEXT_MATCH_OPTIMIZATION
 #define _USE_FAST_SKIP
@@ -220,6 +220,13 @@ class TokenSearcher {
         #endif
     }
 
+    inline uint32_t match_of(const uint8_t* it) {
+        #if ENCODE_MIN == 3
+        return reinterpret_cast<const uint32_t*>(it)[0]&0xffffff;
+        #else
+        return reinterpret_cast<const uint32_t*>(it)[0];
+        #endif
+    }
 
     public:
     TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,HashItem{}), chaintable(CHAIN_SIZE,ChainItem{}) {}
@@ -288,9 +295,9 @@ class TokenSearcher {
             std::fill(candidates.begin(), candidates.end(), false);
             candidates[ hash_of<MICRO_HASH>(ip) ] = true;
 #else
-            std::unordered_set<uint16_t> candidates;
-            candidates.reserve(4);
-            candidates.insert(hash_of(ip));
+            std::unordered_set<uint32_t> candidates;
+            candidates.reserve(LOOK_AHEAD);
+            candidates.insert(match_of(ip));
 #endif
 
             //fast-skip
@@ -302,9 +309,9 @@ class TokenSearcher {
                     break;
                 candidates[hash] = true;
 #else
-                if ( candidates.count(hash_of(ip)) != 0 )
+                if ( candidates.count(match_of(ip)) != 0 )
                     break;
-                candidates.insert(hash_of(ip));
+                candidates.insert(match_of(ip));
 #endif
                 if (no_collision(ip))
                     continue;
