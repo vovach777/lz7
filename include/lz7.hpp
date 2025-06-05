@@ -15,8 +15,10 @@
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
 #define LOOK_AHEAD (2)
-#define RLE_INDEX_TRIGGER 8
+#define RLE_INDEX_TRIGGER 4
 #define _USE_FAST_SKIP
+//#define _USE_JUMP_OVER_MATCH
+#define CHECK_IP_END (sizeof(uint32_t))
 #if CHAIN_LOG2 > 16
 #error "CHAIN_LOG2 > chain is uint16_t only"
 #endif
@@ -53,55 +55,17 @@ inline int ilog2(unsigned v) {
     return targetlevel;
 }
 
-
 inline uint32_t match_of(const uint8_t* it) {
     #if ENCODE_MIN == 3
-        return static_cast<uint16_t>( (reinterpret_cast<const uint32_t*>(it)[0]&0xffffff) );
+        return (reinterpret_cast<const uint32_t*>(it)[0]&0xffffff);
     #else
-        return static_cast<uint16_t>( reinterpret_cast<const uint32_t*>(it)[0] );
+        return (reinterpret_cast<const uint32_t*>(it)[0] );
     #endif
 }
 
-#if LOOK_AHEAD == 4
-inline auto match_mask(const uint8_t * ip) {
-    auto a = match_of(ip);
-    auto b = match_of(ip+1);
-    auto c = match_of(ip+2);
-    auto d = match_of(ip+3);
-    auto e = match_of(ip+4);
-
-    return (  (b == a) ?  0 : 1 )
-         | (  (c == a || c == b) ? 0 : 2 )
-         | (  (d == a || d == b) || (d == c) ? 0 : 4 )
-         | (  (e == a || e == b) || (e == c) || (e == d) ? 0 : 8 );
+inline uint16_t hash_of(const uint8_t* it) {
+    return static_cast<uint16_t>(match_of(it) * 2654435761u >> (32-HASH_LOG2));
 }
-#elif LOOK_AHEAD == 3
-inline auto match_mask(const uint8_t * ip) {
-    auto a = match_of(ip);
-    auto b = match_of(ip+1);
-    auto c = match_of(ip+2);
-    auto d = match_of(ip+3);
-    return (  (b == a) ?  0 : 1 )
-         | (  (c == a || c == b) ? 0 : 2 )
-         | (  (d == a || d == b) || (d == c) ? 0 : 4 );
-}
-#elif LOOK_AHEAD == 2
-inline auto match_mask(const uint8_t * ip) {
-    auto a = match_of(ip);
-    auto b = match_of(ip+1);
-    auto c = match_of(ip+2);
-    return (  (b == a) ?  0 : 1 )
-         | (  (c == a || c == b) ? 0 : 2 );
-}
-#elif LOOK_AHEAD == 1
-inline auto match_mask(const uint8_t * ip) {
-    auto a = match_of(ip);
-    auto b = match_of(ip+1);
-    return (  (b == a) ?  0 : 1 );
-}
-#else
-#error "Unsupported lookahead " ## LOOK_AHEAD
-#endif
 
 class TokenSearcher {
     struct HashItem
@@ -121,7 +85,7 @@ class TokenSearcher {
     uint16_t next_override_item{0};
 
     void register_chain_item(const uint8_t* idx) {
-        if (idx+ENCODE_MIN>=data_end) return;
+        if (idx+CHECK_IP_END>=data_end) return;
         auto hash = hash_of(idx);
         //в хэш-таблице ссылка на следующий элемент в цепочке. там находится размется между текущем смещением и текущим.
         auto& hash_item = hashtabele[hash];
@@ -148,20 +112,33 @@ class TokenSearcher {
 
 
     void index() {
-
         while (idxp < ip) {
+            #ifdef _USE_JUMP_OVER_MATCH
+            if (idxp < emitp) {
+                //индексируем на отвали матч
+                if (no_collision(idxp)) {
+                    register_chain_item(idxp);
+                }
+                idxp++;
+                continue;
+            }
+            #endif
+
             if (idxp == force_index_rle) {
-                force_index_rle = nullptr;
+                //force_index_rle = nullptr;
                 register_chain_item(idxp);
-                idxp += match_len_simd(idxp, idxp + 1, data_end) + 1;
+                idxp += match_len_simd(idxp, data_end, idxp+1, data_end) + 1;
             }
             else
-            if (idxp != force_index_rle &&  is_rle(idxp) && !no_collision(idxp)) {
+            if (is_rle(idxp) && !no_collision(idxp)) {
                 //std::cerr << "RLE-skip-index: " << std::string_view((const char*)idxp, ENCODE_MIN) <<  std::endl;
-                idxp += match_len_simd(idxp, idxp + 1, data_end) + 1;
+                idxp += match_len_simd(idxp, data_end, idxp+1 , data_end) + 1;
             } else {
                 register_chain_item(idxp);
-                idxp++;
+                // if (idxp[0] == idxp[2] && idxp[1] == idxp[3])
+                //     idxp += match_len_simd(idxp,data_end, idxp+2, data_end)+2;
+                // else
+                    idxp++;
             }
         }
     }
@@ -251,23 +228,6 @@ class TokenSearcher {
 
     };
 
-    inline uint16_t hash_of(const uint8_t* it) {
-        #if ENCODE_MIN == 3
-        return static_cast<uint16_t>( (reinterpret_cast<const uint32_t*>(it)[0]&0xffffff) * 2654435761u >> (32-HASH_LOG2) );
-        #else
-        return static_cast<uint16_t>( reinterpret_cast<const uint32_t*>(it)[0] * 2654435761u >> (32-HASH_LOG2) );
-        #endif
-    }
-
-    template <size_t N>
-    inline uint16_t hash_of(const uint8_t* it) {
-        #if ENCODE_MIN == 3
-        return static_cast<uint16_t>( (reinterpret_cast<const uint32_t*>(it)[0]&0xffffff) * 2654435761u >> (32-N) );
-        #else
-        return static_cast<uint16_t>( reinterpret_cast<const uint32_t*>(it)[0] * 2654435761u >> (32-N) );
-        #endif
-    }
-
 
     public:
     TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,HashItem{}), chaintable(CHAIN_SIZE,ChainItem{}) {}
@@ -301,7 +261,7 @@ class TokenSearcher {
         };
         for (;;)
         {
-            if (ip + ENCODE_MIN > data_end){
+            if (ip + CHECK_IP_END > data_end){
                 emit();
                 break;
             }
@@ -313,11 +273,15 @@ class TokenSearcher {
 
 #if LOOK_AHEAD > 0
             auto ip_last = emitp+LOOK_AHEAD;
-            if (ip_last+sizeof(uint32_t) <= data_end && ip+1 <= ip_last) {
-                auto mask = match_mask(ip);
-                ip++;
-                auto pos_mask = 1;
-                for (; (mask & pos_mask) && ip <= ip_last; ip += 1, pos_mask <<= 1) {
+            if (ip_last+CHECK_IP_END <= data_end && ip+1 <= ip_last) {
+                uint32_t p_m, pp_m = match_of(ip);
+                ++ip;
+                for (; ip <= ip_last; ip++) {
+                    auto m = match_of(ip);
+                    if (m == p_m || m == pp_m) {
+                        break;
+                    }
+                    pp_m = p_m; p_m = m;
                     if (no_collision(ip))//fast-skip
                         continue;
                     auto next_match = search_best();
@@ -334,9 +298,9 @@ class TokenSearcher {
     }
 
 #ifdef _USE_SIMD
-    inline int match_len_simd(const uint8_t* a, const uint8_t* b, const uint8_t* a_end) {
+    inline int match_len_simd(const uint8_t* a, const uint8_t* a_end,const uint8_t* b, const uint8_t* b_end) {
         int len = 0;
-        while (a + 16 <= a_end) {
+        while (a + 16 <= a_end && b + 16 <= b_end) {
             __m128i va = _mm_loadu_si128((__m128i*)a);
             __m128i vb = _mm_loadu_si128((__m128i*)b);
             __m128i cmp = _mm_cmpeq_epi8(va, vb);
@@ -349,10 +313,14 @@ class TokenSearcher {
             b += 16;
         }
         // добить хвост
-        while (a < a_end && *a == *b) {
+        while (a < a_end && b < b_end && *a == *b) {
             ++a; ++b; ++len;
         }
         return len;
+    }
+    template <int inc=1, int above=0, int set=0>
+    inline int inc_above_or_set(int value) {
+        return value > above ? value + inc : set;
     }
 
     inline int match_len_simd_backward(const uint8_t* a_begin, const uint8_t* a, const uint8_t* b_begin, const uint8_t* b) {
@@ -403,7 +371,7 @@ class TokenSearcher {
         index();
 
         if (is_rle(ip)) {
-            auto len = match_len_simd(ip+1, ip, data_end)+1;
+            auto len = match_len_simd(ip+1, data_end, ip, data_end)+1;
             auto backlen = match_len_simd_backward(data_begin,ip-1,emitp, ip);
             auto rle_len = len + backlen;
             auto rle_ofs = ip - backlen;
@@ -422,7 +390,7 @@ class TokenSearcher {
         #ifdef _USE_FAST_SKIP
         else {
             auto fast_skip_len = 0;
-            while (ip+ENCODE_MIN <= data_end && no_collision(ip)) {
+            while (ip+CHECK_IP_END <= data_end && no_collision(ip)) {
                 ip++;
                 index();
                 fast_skip_len++;
@@ -431,7 +399,7 @@ class TokenSearcher {
             // if (fast_skip_len > 0) {
             //      std::cerr << "fast skip: " << std::string_view((const char*)ip-fast_skip_len, fast_skip_len) << std::endl;
             // }
-            if ( ip+ENCODE_MIN > data_end )
+            if ( ip+CHECK_IP_END > data_end )
                 return best;
         }
         #endif
@@ -464,7 +432,7 @@ class TokenSearcher {
             if (idx >= ip)
                 continue;
 #ifdef _USE_SIMD
-            auto  match_len = match_len_simd(ip, idx, data_end);
+            auto  match_len = match_len_simd(ip, data_end, idx, data_end);
 #else
             auto [ it_mismatch, ip_mismatch ] = std::mismatch(it, data_end, ip, data_end);
             int match_len = std::distance(it, it_mismatch);
