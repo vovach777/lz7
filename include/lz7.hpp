@@ -14,10 +14,8 @@
 #define CHAIN_LOG2 (16)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
-#define LOOK_AHEAD (3)
-#define MICRO_HASH (8)
+#define LOOK_AHEAD (2)
 #define RLE_INDEX_TRIGGER 8
-//#define _USE_NEXT_MATCH_OPTIMIZATION
 #define _USE_FAST_SKIP
 #if CHAIN_LOG2 > 16
 #error "CHAIN_LOG2 > chain is uint16_t only"
@@ -54,6 +52,56 @@ inline int ilog2(unsigned v) {
     while (v>>=1) ++targetlevel;
     return targetlevel;
 }
+
+
+inline uint32_t match_of(const uint8_t* it) {
+    #if ENCODE_MIN == 3
+        return static_cast<uint16_t>( (reinterpret_cast<const uint32_t*>(it)[0]&0xffffff) );
+    #else
+        return static_cast<uint16_t>( reinterpret_cast<const uint32_t*>(it)[0] );
+    #endif
+}
+
+#if LOOK_AHEAD == 4
+inline auto match_mask(const uint8_t * ip) {
+    auto a = match_of(ip);
+    auto b = match_of(ip+1);
+    auto c = match_of(ip+2);
+    auto d = match_of(ip+3);
+    auto e = match_of(ip+4);
+
+    return (  (b == a) ?  0 : 1 )
+         | (  (c == a || c == b) ? 0 : 2 )
+         | (  (d == a || d == b) || (d == c) ? 0 : 4 )
+         | (  (e == a || e == b) || (e == c) || (e == d) ? 0 : 8 );
+}
+#elif LOOK_AHEAD == 3
+inline auto match_mask(const uint8_t * ip) {
+    auto a = match_of(ip);
+    auto b = match_of(ip+1);
+    auto c = match_of(ip+2);
+    auto d = match_of(ip+3);
+    return (  (b == a) ?  0 : 1 )
+         | (  (c == a || c == b) ? 0 : 2 )
+         | (  (d == a || d == b) || (d == c) ? 0 : 4 );
+}
+#elif LOOK_AHEAD == 2
+inline auto match_mask(const uint8_t * ip) {
+    auto a = match_of(ip);
+    auto b = match_of(ip+1);
+    auto c = match_of(ip+2);
+    return (  (b == a) ?  0 : 1 )
+         | (  (c == a || c == b) ? 0 : 2 );
+}
+#elif LOOK_AHEAD == 1
+inline auto match_mask(const uint8_t * ip) {
+    auto a = match_of(ip);
+    auto b = match_of(ip+1);
+    return (  (b == a) ?  0 : 1 );
+}
+#else
+#error "Unsupported lookahead " ## LOOK_AHEAD
+#endif
 
 class TokenSearcher {
     struct HashItem
@@ -262,59 +310,24 @@ class TokenSearcher {
                 ip++;
                 continue;
             }
-#ifdef _USE_NEXT_MATCH_OPTIMIZATION
-            if (!match.is_self_reference(*this) &&  match.test_short() && std::distance(emitp,match.ip2) <= 3) {
-                //try more aggresive
-                ip = emitp + 3;
-                auto next_match = search_best();
-                if (next_match.gain > match.gain) {
-                    match = next_match;
-                }
-            } else
-            if (!match.is_self_reference(*this) &&   std::distance(emitp,match.ip2) <= 6) {
-                //try more aggresive
-                ip = emitp + 6;
-                auto next_match = search_best();
-                if (next_match.gain > match.gain) {
-                    match = next_match;
-                }
-            }
-
-#else
 
 #if LOOK_AHEAD > 0
-#if MICRO_HASH > 0
-            alignas(32) std::array<bool, 1 << MICRO_HASH> candidates;
-            std::fill(candidates.begin(), candidates.end(), false);
-            candidates[ hash_of<MICRO_HASH>(ip) ] = true;
-#else
-            std::unordered_set<uint16_t> candidates;
-            candidates.reserve(4);
-            candidates.insert(hash_of(ip));
-#endif
-
-            //fast-skip
-            for (ip+=1; ip < emitp+LOOK_AHEAD; ip += 1)
-            {
-#if MICRO_HASH > 0
-                const uint16_t hash = hash_of<MICRO_HASH>(ip);
-                if (candidates[hash])
-                    break;
-                candidates[hash] = true;
-#else
-                if ( candidates.count(hash_of(ip)) != 0 )
-                    break;
-                candidates.insert(hash_of(ip));
-#endif
-                if (no_collision(ip))
-                    continue;
-                auto next_match = search_best();
-                if (next_match.gain > match.gain) {
-                    match = next_match;
+            auto ip_last = emitp+LOOK_AHEAD;
+            if (ip_last+sizeof(uint32_t) <= data_end && ip+1 <= ip_last) {
+                auto mask = match_mask(ip);
+                ip++;
+                auto pos_mask = 1;
+                for (; (mask & pos_mask) && ip <= ip_last; ip += 1, pos_mask <<= 1) {
+                    if (no_collision(ip))//fast-skip
+                        continue;
+                    auto next_match = search_best();
+                    if (next_match.gain > match.gain) {
+                        match = next_match;
+                    }
                 }
             }
 #endif
-#endif
+
             emit(match);
         }
 
