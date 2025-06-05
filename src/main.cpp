@@ -8,6 +8,7 @@
 #include "lz7.hpp"
 #include "mio.hpp"
 #include "profiling.hpp"
+#define DEBUG_OUTPUT
 
 
 int main(int argc, char** argv) {
@@ -32,7 +33,7 @@ int main(int argc, char** argv) {
 
 
     profiling::StopWatch sw;
-    std::cout << "loading file to memory..." << std::flush;
+    std::cout << "loading file into memory..." << std::flush;
     sw.start();
     std::vector<uint8_t> data(mmap.begin(), mmap.end());
     sw.stop();
@@ -40,21 +41,28 @@ int main(int argc, char** argv) {
     sw.startnew();
     lz_comp(data.data(), data.data()+data.size(),[&](int offset, int len, const uint8_t * literals, int literals_len ) {
 
+            //Token,offset,literals,match
+            //Token,0,literals
             if (offset == 0) {
                 assert(len == 0);
-                out.push_back(0x80 | std::min(literals_len, 31));
-                out.push_back(0);
-                if (literals_len-31 >= 0) {
-                    //offset_10 not pass here
+                int literals_len1 = std::min(literals_len, 3);
+                len = std::max(literals_len - literals_len1, 0);//override len
+                out.push_back(0x80 | (literals_len1 << 3) | std::min(7,len));
+                for (int i = 0; i < literals_len1; ++i) {
+                    out.push_back(literals[i]);
+                }
+                out.push_back(0); //offset low
+                //len as extended literals length
+                if (len-7 >= 0) {
                     for (int ext255=0;;)
                     {
-                        auto chunk = std::min(literals_len-31-ext255*255,255);
+                        auto chunk = std::min(len-7-ext255*255,255);
                         out.push_back( chunk );
                         if (chunk < 255) break;
                         ext255++;
                     }
                 }
-                for (int i = 0; i < literals_len; ++i) {
+                for (int i = 3; i < literals_len; ++i) {
                     out.push_back(literals[i]);
                 }
                 return;
@@ -64,7 +72,6 @@ int main(int argc, char** argv) {
             assert(literals_len >= 0);
 
 
-            //1_00_LL_LLL 0000_0000
 
             //out.push_back( (std::min(len-ENCODE_MIN,15))  | std::min(literals_len,15) << 4 );
             //1_xx_LL_MMM xxxx_xxxx
@@ -77,6 +84,7 @@ int main(int argc, char** argv) {
                 //0_x_LLL_MMM xxxx_xxxx xxxx_xxxx
                 out.push_back(  ((offset >> 16) << 6)  | (std::min(7,literals_len) << 3) | std::min(7,len-ENCODE_MIN)  );
             }
+
             if (literals_len-7 >= 0) {
                 //offset_10 not pass here
                 for (int ext255=0;;)
