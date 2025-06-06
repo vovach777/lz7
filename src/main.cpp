@@ -39,24 +39,36 @@ int main(int argc, char** argv) {
     sw.stop();
     std::cout << " " << sw.elapsed_str() <<    std::endl;
     sw.startnew();
-    lz_comp(data.data(), data.data()+data.size(),[&](int offset, int len, const uint8_t * literals, int literals_len ) {
-
-            //Token,offset,literals,match
-            //Token,0,literals
-            if (offset == 0) {
-                assert(len == 0);
-                int literals_len1 = std::min(literals_len, 3);
-                len = std::max(literals_len - literals_len1, 0);//override len
-                out.push_back(0x80 | (literals_len1 << 3) | std::min(7,len));
-                for (int i = 0; i < literals_len1; ++i) {
-                    out.push_back(literals[i]);
+#ifdef DEBUG_OUTPUT
+    size_t position{0};
+#endif
+    lz_comp(data.data(), data.data()+data.size(),
+            [&](int offset, int len, const uint8_t * literals, int literals_len ) {
+#ifdef DEBUG_OUTPUT
+                if ( offset == 0) {
+                    assert(len == 0); //pattern not supported yet
+                    std::cerr << std::setw(6) << std::setfill('0') << position <<  ": L<" <<  std::string_view(reinterpret_cast<const char*>(literals), literals_len) << ">" << std::endl;
+                    position += literals_len;
+                } else {
+                    if (literals_len) {
+                        std::cerr << std::setw(6) << std::setfill('0') << position <<  ": L<" << std::string_view(reinterpret_cast<const char*>(literals), literals_len) << ">" << std::endl;
+                        position += literals_len;
+                    }
+                    std::cerr << std::setw(6) << std::setfill('0') << position <<  ": M<" << offset << "," << len << ">" << std::endl;
+                    position += len;
                 }
-                out.push_back(0); //offset low
-                //len as extended literals length
-                if (len-7 >= 0) {
+#endif
+            //Token,[extlit],literals,offset,[ext-match]
+            if (offset == 0) {
+                //Token,literals,0
+                assert(len == 0);
+                out.push_back(0x80  | std::min(7,literals_len));//make sure if offset is 0 then match = literals len
+                out.push_back(0); //offset low=0
+                //ext-match = literals_len (offset == 0)
+                if (literals_len-7 >= 0) {
                     for (int ext255=0;;)
                     {
-                        auto chunk = std::min(len-7-ext255*255,255);
+                        auto chunk = std::min(literals_len-7-ext255*255,255);
                         out.push_back( chunk );
                         if (chunk < 255) break;
                         ext255++;
@@ -68,20 +80,20 @@ int main(int argc, char** argv) {
                 return;
             }
             assert(offset > 0);
-            assert(len >= 0);
+            assert(len >= ENCODE_MIN);
             assert(literals_len >= 0);
 
 
 
             //out.push_back( (std::min(len-ENCODE_MIN,15))  | std::min(literals_len,15) << 4 );
-            //1_xx_LL_MMM xxxx_xxxx
+            //1_xx_LL_MMM xxxx xxxx [extMMM]
             bool offset_10 = false;
             if (offset < (1 << 10) && literals_len < 4 ) {
                 offset_10 = true;
                 out.push_back( 0x80 | ((offset >> 8) << 5)  | (literals_len << 3) | std::min(7,len-ENCODE_MIN) );
             } else {
                 assert(offset < (1 << 17));
-                //0_x_LLL_MMM xxxx_xxxx xxxx_xxxx
+                //0_x_LLL_MMM [extLLL]  xxxx_xxxx xxxx_xxxx [extMMM]
                 out.push_back(  ((offset >> 16) << 6)  | (std::min(7,literals_len) << 3) | std::min(7,len-ENCODE_MIN)  );
             }
 
@@ -89,10 +101,10 @@ int main(int argc, char** argv) {
                 //offset_10 not pass here
                 for (int ext255=0;;)
                 {
-                    auto chunk = std::min(literals_len-7-ext255*255,255);
+                    auto chunk = std::min(literals_len-7-ext255,255);
                     out.push_back( chunk );
                     if (chunk < 255) break;
-                    ext255++;
+                    ext255+=255;
                 }
             }
             for (int i = 0; i < literals_len; ++i) {
@@ -105,15 +117,14 @@ int main(int argc, char** argv) {
                 out.push_back( (offset >> 8) & 0xff );
             }
 
-
             if (len-ENCODE_MIN-7 >= 0) {
 
                 for (int ext255=0;;)
                 {
-                    auto chunk = std::min(len-ENCODE_MIN-7-ext255*255,255);
+                    auto chunk = std::min(len-ENCODE_MIN-7-ext255,255);
                     out.push_back( chunk );
                     if (chunk < 255) break;
-                    ext255++;
+                    ext255+=255;
                 }
             }
 
