@@ -155,36 +155,16 @@ class TokenSearcher {
         const uint8_t* ip2{};
         int len{};
         int gain{std::numeric_limits<int>::min()};
-        bool is_self_reference(const TokenSearcher& ctx) const {
-            return ofs + len > ctx.emitp;
-        }
-        int self_reference_count(const TokenSearcher& ctx) const {
-            return std::max<ptrdiff_t>(0, (ofs+len) - ctx.emitp);
-        }
+
         auto test_ofs() const {
             return std::distance( ofs , ip2);
         }
         auto test_short() const {
             return test_ofs() < (1<<10);
         }
-
-        size_t intersect_len(const uint8_t* first1, const uint8_t* last1,
-            const uint8_t* first2, const uint8_t* last2) const {
-            // Находим потенциальное начало пересечения
-            // Это наибольший из двух начальных указателей
-            const uint8_t* intersection_first = std::max(first1, first2);
-
-            // Находим потенциальный конец пересечения
-            // Это наименьший из двух конечных указателей
-            const uint8_t* intersection_last = std::min(last1, last2);
-
-            // Если начало пересечения меньше конца, значит пересечение существует
-            if (intersection_first < intersection_last) {
-                return std::distance(intersection_first, intersection_last);
-            } else {
-                // В противном случае пересечения нет, возвращаем (last1, last1)
-                return 0;
-            }
+        auto is_short(const TokenSearcher& ctx) const {
+            auto literal_len = std::distance(ctx.emitp,ip2);
+            return len >= ENCODE_MIN && test_short() && (literal_len <= 3);
         }
 
         void set_to_literals(const TokenSearcher& ctx) {
@@ -192,15 +172,15 @@ class TokenSearcher {
              len = 0;
              gain = -2 /*cost*/ - literal_len - (literal_len + 255 - 31) / 255;
         }
+
         void optimize(const TokenSearcher& ctx) {
             assert(ip2 >= ctx.emitp);
             if (len < ENCODE_MIN || test_ofs() > MAX_OFFSET) {
                 set_to_literals(ctx);
                 return;
             }
-            if (len == ENCODE_MIN+7) {
-                len--;
-                //std::cerr << "optimzation len==11 is useless" << std::endl;
+            if (len == 7+ENCODE_MIN) {
+                len--; //  std::cerr << "optimzation len==11 is useless" << std::endl;
             }
             assert(test_ofs() > 0);
             auto literal_len = std::distance(ctx.emitp,ip2);
@@ -212,9 +192,13 @@ class TokenSearcher {
             } else
                 cost = 3 + literal_cost(literal_len) + match_cost(len);
             gain = len - cost - literal_len;
+            
+            //add a little bit gain to keep literals in range 3
+            if (test_short() && literal_len <= 3)
+                gain += 1;
+    
 
         }
-
 
         static int literal_cost(unsigned long nlit)
         {
@@ -409,7 +393,7 @@ class TokenSearcher {
         {
             if (nbAttempts == 0) {
                 hash = hash_of(ip);
-                auto  & hash_item = hashtabele[hash];
+                auto & hash_item = hashtabele[hash];
                 idx = hash_item.idx;
                 if (idx == nullptr)
                     break;

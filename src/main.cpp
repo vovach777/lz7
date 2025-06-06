@@ -8,7 +8,7 @@
 #include "lz7.hpp"
 #include "mio.hpp"
 #include "profiling.hpp"
-#define DEBUG_OUTPUT
+//#define DEBUG_OUTPUT
 
 
 int main(int argc, char** argv) {

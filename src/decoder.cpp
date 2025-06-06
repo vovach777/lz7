@@ -155,12 +155,9 @@ int main(int argc, char** argv) {
          std::cerr << "Usage: " << argv[0] << " <image_path>" << std::endl;
          return 1;
     }
-
-#if 1
+    
     const char* filename = argv[1];
-#else
-    const char* filename = "D:\\Sources\\C++\\Projects\\lz7\\samples\\1.txt.lz7";
-#endif
+
     // std::ifstream instream(filename, std::ios::in | std::ios::binary);
     // std::vector<uint8_t> data((std::istreambuf_iterator<char>(instream)), std::istreambuf_iterator<char>());
     std::error_code error;
