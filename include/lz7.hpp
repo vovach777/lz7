@@ -262,6 +262,7 @@ class TokenSearcher {
         for (;;)
         {
             if (ip + CHECK_IP_END > data_end){
+                ip = data_end;
                 emit();
                 break;
             }
