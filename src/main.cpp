@@ -8,12 +8,11 @@
 #include "lz7.hpp"
 #include "mio.hpp"
 #include "profiling.hpp"
-//#define DEBUG_OUTPUT
 
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-         std::cerr << "Usage: " << argv[0] << " <image_path>" << std::endl;
+         std::cerr << "Usage: " << argv[0] << " <filename>" << std::endl;
          return 1;
     }
     const char* filename = argv[1];
@@ -39,25 +38,9 @@ int main(int argc, char** argv) {
     sw.stop();
     std::cout << " " << sw.elapsed_str() <<    std::endl;
     sw.startnew();
-#ifdef DEBUG_OUTPUT
-    size_t position{0};
-#endif
+
     lz_comp(data.data(), data.data()+data.size(),
             [&](int offset, int len, const uint8_t * literals, int literals_len ) {
-#ifdef DEBUG_OUTPUT
-                if ( offset == 0) {
-                    assert(len == 0); //pattern not supported yet
-                    std::cerr << std::setw(6) << std::setfill('0') << position <<  ": L<" <<  std::string_view(reinterpret_cast<const char*>(literals), literals_len) << ">" << std::endl;
-                    position += literals_len;
-                } else {
-                    if (literals_len) {
-                        std::cerr << std::setw(6) << std::setfill('0') << position <<  ": L<" << std::string_view(reinterpret_cast<const char*>(literals), literals_len) << ">" << std::endl;
-                        position += literals_len;
-                    }
-                    std::cerr << std::setw(6) << std::setfill('0') << position <<  ": M<" << offset << "," << len << ">" << std::endl;
-                    position += len;
-                }
-#endif
             //Token,[extlit],literals,offset,[ext-match]
             if (offset == 0) {
                 //Token,literals,0
@@ -74,7 +57,7 @@ int main(int argc, char** argv) {
                         ext255++;
                     }
                 }
-                for (int i = 3; i < literals_len; ++i) {
+                for (int i = 0; i < literals_len; ++i) {
                     out.push_back(literals[i]);
                 }
                 return;

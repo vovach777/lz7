@@ -15,9 +15,14 @@
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
 #define LOOK_AHEAD (2)
-#define RLE_INDEX_TRIGGER 4
-#define _USE_FAST_SKIP
-//#define _USE_JUMP_OVER_MATCH
+#define RLE_INDEX_TRIGGER 16
+#define RLE_INDEX_DISTANCE 0x1000
+#define REP2_INDEX_DISTANCE 0x1000
+#define RLE_ACCEPTABLE_GAIN  0x100
+#define BEST_ACCEPTABLE_GAIN 0x100
+#define LOOK_AHEAD_ACCEPTABLE_GAIN 0x100
+//#define _USE_FAST_SKIP
+#define _USE_JUMP_OVER_MATCH
 #define CHECK_IP_END (sizeof(uint32_t))
 #if CHAIN_LOG2 > 16
 #error "CHAIN_LOG2 > chain is uint16_t only"
@@ -49,10 +54,21 @@ inline bool is_rle(const uint8_t* r) {
 
 }
 
+inline bool is_rep2(const uint8_t* r) {
+
+    return std::memcmp(r, r+2, 2) == 0;
+
+}
+
 inline int ilog2(unsigned v) {
     int targetlevel = 1;
     while (v>>=1) ++targetlevel;
     return targetlevel;
+}
+
+template <int inc=1, int above=0, int set=0>
+inline int inc_above_or_set(int value) {
+    return value > above ? value + inc : set;
 }
 
 inline uint32_t match_of(const uint8_t* it) {
@@ -83,6 +99,22 @@ class TokenSearcher {
     std::vector<HashItem> hashtabele; //index to chain
     std::vector<ChainItem> chaintable;
     uint16_t next_override_item{0};
+    const uint8_t* data_begin;
+    const uint8_t* data_end;
+    const uint8_t* ip;
+    const uint8_t* idxp;
+    const uint8_t* emitp;
+    Put_function put;
+    const uint8_t* force_index_rle{nullptr};
+
+    inline bool no_collision(const uint8_t* idx) const {
+        idx =  hashtabele[hash_of(idx)].idx;//idx to hashed-idx =)
+        return idx==nullptr || (emitp-idx) > MAX_OFFSET;
+    }
+
+    inline auto far_collision(const uint8_t* idx) const {
+        return idx - hashtabele[hash_of(idx)].idx ;//idx to hashed-idx =)
+    }
 
     void register_chain_item(const uint8_t* idx) {
         if (idx+CHECK_IP_END>=data_end) return;
@@ -116,9 +148,8 @@ class TokenSearcher {
             #ifdef _USE_JUMP_OVER_MATCH
             if (idxp < emitp) {
                 //индексируем на отвали матч
-                if (no_collision(idxp)) {
-                    register_chain_item(idxp);
-                }
+                if (no_collision(idxp) || far_collision(idxp) >= 16 ) 
+                    register_chain_item(idxp); 
                 idxp++;
                 continue;
             }
@@ -130,10 +161,20 @@ class TokenSearcher {
                 idxp += match_len_simd(idxp, data_end, idxp+1, data_end) + 1;
             }
             else
-            if (is_rle(idxp) && !no_collision(idxp)) {
+            if (is_rle(idxp)) {
                 //std::cerr << "RLE-skip-index: " << std::string_view((const char*)idxp, ENCODE_MIN) <<  std::endl;
+                if (no_collision(idxp) || far_collision(idxp) >= RLE_INDEX_DISTANCE ) 
+                    register_chain_item(idxp); 
                 idxp += match_len_simd(idxp, data_end, idxp+1 , data_end) + 1;
-            } else {
+            } 
+            else
+            if (is_rep2(idxp)) {
+                //std::cerr << "REP2-skip-index: " << std::string_view((const char*)idxp, ENCODE_MIN) <<  std::endl;
+                if (no_collision(idxp) || far_collision(idxp) >= REP2_INDEX_DISTANCE ) 
+                    register_chain_item(idxp); 
+                idxp += match_len_simd(idxp, data_end, idxp+2 , data_end) + 2;
+            }
+            else {
                 register_chain_item(idxp);
                 // if (idxp[0] == idxp[2] && idxp[1] == idxp[3])
                 //     idxp += match_len_simd(idxp,data_end, idxp+2, data_end)+2;
@@ -142,13 +183,6 @@ class TokenSearcher {
             }
         }
     }
-
-    const uint8_t* data_begin;
-    const uint8_t* data_end;
-    const uint8_t* ip;
-    const uint8_t* idxp;
-    const uint8_t* emitp;
-    Put_function put;
 
     struct Best{
         const uint8_t* ofs{};
@@ -196,8 +230,6 @@ class TokenSearcher {
             //add a little bit gain to keep literals in range 3
             if (test_short() && literal_len <= 3)
                 gain += 1;
-    
-
         }
 
         static int literal_cost(unsigned long nlit)
@@ -216,6 +248,7 @@ class TokenSearcher {
     public:
     TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,HashItem{}), chaintable(CHAIN_SIZE,ChainItem{}) {}
 
+ 
 
     void emit(const Best & best) {
 
@@ -237,7 +270,6 @@ class TokenSearcher {
         }
     }
 
-
     void compress() {
         ip+=1;
         if (ip > data_end) {
@@ -257,21 +289,23 @@ class TokenSearcher {
             }
 
 #if LOOK_AHEAD > 0
-            auto ip_last = emitp+LOOK_AHEAD;
-            if (ip_last+CHECK_IP_END <= data_end && ip+1 <= ip_last) {
-                uint32_t p_m, pp_m = match_of(ip);
-                ++ip;
-                for (; ip <= ip_last; ip++) {
-                    auto m = match_of(ip);
-                    if (m == p_m || m == pp_m) {
-                        break;
-                    }
-                    pp_m = p_m; p_m = m;
-                    if (no_collision(ip))//fast-skip
-                        continue;
-                    auto next_match = search_best();
-                    if (next_match.gain > match.gain) {
-                        match = next_match;
+            if (match.gain  < LOOK_AHEAD_ACCEPTABLE_GAIN) {          
+                auto ip_last = emitp+LOOK_AHEAD;
+                if (ip_last+CHECK_IP_END <= data_end && ip+1 <= ip_last) {
+                    uint32_t p_m, pp_m = match_of(ip);
+                    ++ip;
+                    for (; ip <= ip_last; ip++) {
+                        auto m = match_of(ip);
+                        if (m == p_m || m == pp_m) {
+                            break;
+                        }
+                        pp_m = p_m; p_m = m;
+                        if (no_collision(ip))//fast-skip
+                            continue;
+                        auto next_match = search_best();
+                        if (next_match.gain > match.gain) {
+                            match = next_match;
+                        } 
                     }
                 }
             }
@@ -282,9 +316,9 @@ class TokenSearcher {
 
     }
 
-#ifdef _USE_SIMD
     inline int match_len_simd(const uint8_t* a, const uint8_t* a_end,const uint8_t* b, const uint8_t* b_end) {
         int len = 0;
+        #ifdef _USE_SIMD
         while (a + 16 <= a_end && b + 16 <= b_end) {
             __m128i va = _mm_loadu_si128((__m128i*)a);
             __m128i vb = _mm_loadu_si128((__m128i*)b);
@@ -297,19 +331,17 @@ class TokenSearcher {
             a += 16;
             b += 16;
         }
+        #endif
         // добить хвост
         while (a < a_end && b < b_end && *a == *b) {
             ++a; ++b; ++len;
         }
         return len;
     }
-    template <int inc=1, int above=0, int set=0>
-    inline int inc_above_or_set(int value) {
-        return value > above ? value + inc : set;
-    }
 
     inline int match_len_simd_backward(const uint8_t* a_begin, const uint8_t* a, const uint8_t* b_begin, const uint8_t* b) {
         int len = 0;
+        #ifdef _USE_SIMD
         while (a - 15 >= a_begin && b - 15 >= b_begin) {
             __m128i va = _mm_loadu_si128((const __m128i*)(a - 15));
             __m128i vb = _mm_loadu_si128((const __m128i*)(b - 15));
@@ -328,6 +360,7 @@ class TokenSearcher {
             a -= 16;
             b -= 16;
         }
+        #endif
 
         while (a >= a_begin && b >= b_begin && *a == *b) {
             --a;
@@ -337,14 +370,6 @@ class TokenSearcher {
 
         return len;
     }
-    #endif
-
-    const uint8_t* force_index_rle{nullptr};
-    inline bool no_collision(const uint8_t* idx) {
-        idx =  hashtabele[hash_of(idx)].idx;//idx to hashed-idx =)
-        return idx==nullptr || (emitp-idx) > MAX_OFFSET;
-    }
-
 
     Best search_best() {
         Best best{};
@@ -360,36 +385,42 @@ class TokenSearcher {
             auto backlen = match_len_simd_backward(data_begin,ip-1,emitp, ip);
             auto rle_len = len + backlen;
             auto rle_ofs = ip - backlen;
+            #if RLE_INDEX_TRIGGER > 0
             //1: index this RLE if it is long enough or if there is no hash collision
             if (rle_len >= RLE_INDEX_TRIGGER /*|| (rle_len >= ENCODE_MIN && no_collision(rle_ofs))*/) {
                 force_index_rle = rle_ofs;
             }
+            #endif
 
             //2: create RLE match (self-reference match)
             best.ofs = rle_ofs;
             best.ip2 = rle_ofs + 1;
             best.len = rle_len - 1;
             best.optimize(*this);
+            if (best.gain >= RLE_ACCEPTABLE_GAIN)
+                return best;
 
         }
         #ifdef _USE_FAST_SKIP
         else {
             auto fast_skip_len = 0;
-            while (ip+CHECK_IP_END <= data_end && no_collision(ip)) {
+      
+            while (no_collision(ip)) {
                 ip++;
-                index();
+                if (ip+CHECK_IP_END > data_end)
+                    return best;
+                if (ip-emitp > 16)
+                    return best;
                 fast_skip_len++;
 
             }
             // if (fast_skip_len > 0) {
             //      std::cerr << "fast skip: " << std::string_view((const char*)ip-fast_skip_len, fast_skip_len) << std::endl;
             // }
-            if ( ip+CHECK_IP_END > data_end )
-                return best;
         }
         #endif
 
-        for (int nbAttempts=0; nbAttempts != nbAttemptsMax; nbAttempts++)
+        for (int nbAttempts=0; nbAttempts < nbAttemptsMax; nbAttempts++)
         {
             if (nbAttempts == 0) {
                 hash = hash_of(ip);
@@ -416,11 +447,11 @@ class TokenSearcher {
             //fast skip
             if (idx >= ip)
                 continue;
-#ifdef _USE_SIMD
-            auto  match_len = match_len_simd(ip, data_end, idx, data_end);
-#else
+#ifdef _USE_mismatch
             auto [ it_mismatch, ip_mismatch ] = std::mismatch(it, data_end, ip, data_end);
             int match_len = std::distance(it, it_mismatch);
+#else
+            auto  match_len = match_len_simd(ip, data_end, idx, data_end);
 #endif
 
             if (match_len < ENCODE_MIN)
@@ -428,20 +459,12 @@ class TokenSearcher {
             // if (it_mismatch > ip) {
             //   //  std::cerr << "self-ref: " <<  it_mismatch-ip <<   std::endl;
             // }
-#ifdef _USE_SIMD
+
             int back_match_len = match_len_simd_backward(data_begin, idx-1, emitp,  ip-1);
             auto ip2 = ip - back_match_len;
             idx  -= back_match_len;
             match_len += back_match_len;
-#else
-            //back matching
-            auto ip2 = ip;
-            while (  it > data_begin  &&  ip2 > emitp  &&  it[-1] == ip2[-1] ) {
-                --it;
-                --ip2;
-                ++match_len;
-            }
-#endif
+
             assert(ip2 >= emitp);
             assert(idx >= data_begin);
             //assert(it + match <= ip2);
@@ -452,7 +475,9 @@ class TokenSearcher {
             if (after.gain > best.gain) {
                 best = after;
                 //std::cerr << " gain search step: " << (best.gain - after.gain) << std::endl;
-            }
+            } else 
+                if (best.gain >= BEST_ACCEPTABLE_GAIN )
+                    break;
         }
     return best;
     }

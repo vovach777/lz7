@@ -152,7 +152,7 @@ void lz7expand(const uint8_t*  begin, const uint8_t*  end, Put_bytes put, Move_b
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-         std::cerr << "Usage: " << argv[0] << " <image_path>" << std::endl;
+         std::cerr << "Usage: " << argv[0] << " <filename>" << std::endl;
          return 1;
     }
     
