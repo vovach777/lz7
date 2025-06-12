@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
 
     std::vector<uint8_t> out;
     out.reserve(mmap.size() / 2);
-
+    auto bi = std::back_inserter(out);
 
     profiling::StopWatch sw;
     std::cout << "loading file into memory..." << std::flush;
@@ -45,21 +45,19 @@ int main(int argc, char** argv) {
             if (offset == 0) {
                 //Token,literals,0
                 assert(len == 0);
-                out.push_back(0x80  | std::min(7,literals_len));//make sure if offset is 0 then match = literals len
-                out.push_back(0); //offset low=0
+                *bi = (0x80  | std::min(7,literals_len));//make sure if offset is 0 then match = literals len
+                *bi = (0); //offset low=0
                 //ext-match = literals_len (offset == 0)
                 if (literals_len-7 >= 0) {
                     for (int ext255=0;;)
                     {
                         auto chunk = std::min(literals_len-7-ext255*255,255);
-                        out.push_back( chunk );
+                        *bi = chunk;
                         if (chunk < 255) break;
                         ext255++;
                     }
                 }
-                for (int i = 0; i < literals_len; ++i) {
-                    out.push_back(literals[i]);
-                }
+                std::copy(literals, literals+literals_len, bi);
                 return;
             }
             assert(offset > 0);
@@ -73,11 +71,11 @@ int main(int argc, char** argv) {
             bool offset_10 = false;
             if (offset < (1 << 10) && literals_len < 4 ) {
                 offset_10 = true;
-                out.push_back( 0x80 | ((offset >> 8) << 5)  | (literals_len << 3) | std::min(7,len-ENCODE_MIN) );
+                *bi = ( 0x80 | ((offset >> 8) << 5)  | (literals_len << 3) | std::min(7,len-ENCODE_MIN) );
             } else {
                 assert(offset < (1 << 17));
                 //0_x_LLL_MMM [extLLL]  xxxx_xxxx xxxx_xxxx [extMMM]
-                out.push_back(  ((offset >> 16) << 6)  | (std::min(7,literals_len) << 3) | std::min(7,len-ENCODE_MIN)  );
+                *bi = (  ((offset >> 16) << 6)  | (std::min(7,literals_len) << 3) | std::min(7,len-ENCODE_MIN)  );
             }
 
             if (literals_len-7 >= 0) {
@@ -85,19 +83,17 @@ int main(int argc, char** argv) {
                 for (int ext255=0;;)
                 {
                     auto chunk = std::min(literals_len-7-ext255,255);
-                    out.push_back( chunk );
+                    *bi = ( chunk );
                     if (chunk < 255) break;
                     ext255+=255;
                 }
             }
-            for (int i = 0; i < literals_len; ++i) {
-                out.push_back(literals[i]);
-            }
+            std::copy(literals, literals+literals_len, bi);
 
             //assert(offset < 65536);
-            out.push_back( offset & 0xff );
+            *bi = ( offset & 0xff );
             if (!offset_10) {
-                out.push_back( (offset >> 8) & 0xff );
+                *bi = ( (offset >> 8) & 0xff );
             }
 
             if (len-ENCODE_MIN-7 >= 0) {
@@ -105,7 +101,7 @@ int main(int argc, char** argv) {
                 for (int ext255=0;;)
                 {
                     auto chunk = std::min(len-ENCODE_MIN-7-ext255,255);
-                    out.push_back( chunk );
+                    *bi = ( chunk );
                     if (chunk < 255) break;
                     ext255+=255;
                 }
