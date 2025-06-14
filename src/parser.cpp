@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
 
     size_t position{0};
 
-    lz_comp(data.data(), data.data()+data.size(),
+    lz7::compress(data.data(), data.data()+data.size(),
             [&](int offset, int len, const uint8_t * literals, int literals_len ) {
 
             if ( offset == 0) {

@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
     std::cout << " " << sw.elapsed_str() <<    std::endl;
     sw.startnew();
 
-    lz_comp(data.data(), data.data()+data.size(),
+    lz7::compress(data.data(), data.data()+data.size(),
             [&](int offset, int len, const uint8_t * literals, int literals_len ) {
             //Token,[extlit],literals,offset,[ext-match]
             if (offset == 0) {

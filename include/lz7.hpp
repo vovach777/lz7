@@ -6,23 +6,22 @@
 #define MAX_OFFSET ((1 << 17)-1)
 #define NO_MATCH_OFS (MAX_OFFSET)
 #define ENCODE_MIN (4)
-#define MAX_ITER_SCAN (16)
-#define MAX_LEN (65535)
-#define MAX_MATCH (MAX_LEN+ENCODE_MIN)
+#define MAX_ATTEMPTS (16)
 #define HASH_LOG2 (16)
 #define HASH_SIZE (1 << HASH_LOG2)
 #define CHAIN_LOG2 (16)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
 #define LOOK_AHEAD (2)
-#define RLE_INDEX_TRIGGER 16
+#define RLE_INDEX_TRIGGER 10
 #define RLE_INDEX_DISTANCE 0x1000
 #define REP2_INDEX_DISTANCE 0x1000
-#define RLE_ACCEPTABLE_GAIN  0x100
-#define BEST_ACCEPTABLE_GAIN 0x100
-#define LOOK_AHEAD_ACCEPTABLE_GAIN 0x100
+#define RLE_ACCEPTABLE_GAIN  0x1000
+#define BEST_ACCEPTABLE_GAIN 0x1000
+#define LOOK_AHEAD_ACCEPTABLE_GAIN 0x1000
 //#define _USE_FAST_SKIP
-#define _USE_JUMP_OVER_MATCH
+#define _USE_JUMP_OVER_MATCH 0
+//#define _ENABLE_RLE
 #define CHECK_IP_END (sizeof(uint32_t))
 #if CHAIN_LOG2 > 16
 #error "CHAIN_LOG2 > chain is uint16_t only"
@@ -45,6 +44,8 @@
 #include <array>
 #include <optional>
 #include <immintrin.h>
+
+namespace lz7 {
 
 using Put_function = std::function<void(int offset, int len, const uint8_t * literals, int literals_len )>;
 
@@ -83,6 +84,121 @@ inline uint16_t hash_of(const uint8_t* it) {
     return static_cast<uint16_t>(match_of(it) * 2654435761u >> (32-HASH_LOG2));
 }
 
+inline int match_len_simd(const uint8_t* a, const uint8_t* a_end,const uint8_t* b, const uint8_t* b_end) {
+    int len = 0;
+    #ifdef _USE_SIMD
+    while (a + 16 <= a_end && b + 16 <= b_end) {
+        __m128i va = _mm_loadu_si128((__m128i*)a);
+        __m128i vb = _mm_loadu_si128((__m128i*)b);
+        __m128i cmp = _mm_cmpeq_epi8(va, vb);
+        int mask = _mm_movemask_epi8(cmp);
+        if (mask != 0xFFFF) {
+            return len + __builtin_ctz(~mask); // первая разница
+        }
+        len += 16;
+        a += 16;
+        b += 16;
+    }
+    #endif
+    // добить хвост
+    while (a < a_end && b < b_end && *a == *b) {
+        ++a; ++b; ++len;
+    }
+    return len;
+}
+
+inline int match_len_simd_backward(const uint8_t* a_begin, const uint8_t* a, const uint8_t* b_begin, const uint8_t* b) {
+    int len = 0;
+    #ifdef _USE_SIMD
+    while (a - 15 >= a_begin && b - 15 >= b_begin) {
+        __m128i va = _mm_loadu_si128((const __m128i*)(a - 15));
+        __m128i vb = _mm_loadu_si128((const __m128i*)(b - 15));
+        __m128i cmp = _mm_cmpeq_epi8(va, vb);
+        int mask = _mm_movemask_epi8(cmp);
+
+        if (mask != 0xFFFF) {
+            // Ищем первую единицу с конца mask (0 = несовпадение)
+            // Развернём маску для использования __builtin_clz
+            uint32_t inv_mask = (~mask) & 0xFFFF;
+            int leading_zeros = __builtin_clz(inv_mask) - 16; // mask в младших 16 битах
+            return len + leading_zeros;
+        }
+
+        len += 16;
+        a -= 16;
+        b -= 16;
+    }
+    #endif
+
+    while (a >= a_begin && b >= b_begin && *a == *b) {
+        --a;
+        --b;
+        ++len;
+    }
+
+    return len;
+}
+
+struct Best{
+    const uint8_t* ofs{};
+    const uint8_t* ip2{};
+    int len{};
+    int gain{std::numeric_limits<int>::min()};
+
+    int test_ofs() const {
+        return std::distance( ofs , ip2);
+    }
+    auto test_short() const {
+        return test_ofs() < (1<<10);
+    }
+    auto is_short(const uint8_t* emitp) const {
+        auto literal_len = std::distance(emitp,ip2);
+        return len >= ENCODE_MIN && test_short() && (literal_len <= 3);
+    }
+
+    void set_to_literals(const uint8_t* emitp) {
+            auto literal_len = std::distance(emitp,ip2);
+            len = 0;
+            gain = -2 /*cost*/ - literal_len - (literal_len + 255 - 31) / 255;
+    }
+
+    void optimize(const uint8_t* emitp) {
+        assert(ip2 >= emitp);
+        if (len < ENCODE_MIN || test_ofs() > MAX_OFFSET) {
+            set_to_literals(emitp);
+            return;
+        }
+        if (len == 7+ENCODE_MIN) {
+            len--; //  std::cerr << "optimzation len==11 is useless" << std::endl;
+        }
+        assert(test_ofs() > 0);
+        auto literal_len = std::distance(emitp,ip2);
+        assert(literal_len >= 0);
+        // euristic optimization
+        int cost;
+        if (test_short() && literal_len <= 3) {
+            cost =  2 + match_cost(len);
+        } else
+            cost = 3 + literal_cost(literal_len) + match_cost(len);
+        gain = len - cost - literal_len;
+        
+        //add a little bit gain to keep literals in range 3
+        if (test_short() && literal_len <= 3)
+            gain += 1;
+    }
+
+    static int literal_cost(unsigned long nlit)
+    {
+        return (nlit + 255 - 7) / 255;
+    }
+
+    static int match_cost(unsigned long len)
+    {
+        return (len + 255 - ENCODE_MIN - 7) / 255;
+    }
+
+};
+
 class TokenSearcher {
     struct HashItem
     {
@@ -95,7 +211,6 @@ class TokenSearcher {
         uint16_t next_item{CHAIN_BREAK};
         uint16_t offset_relative{0xFFFF};
     };
-
     std::vector<HashItem> hashtabele; //index to chain
     std::vector<ChainItem> chaintable;
     uint16_t next_override_item{0};
@@ -113,10 +228,12 @@ class TokenSearcher {
     }
 
     inline auto far_collision(const uint8_t* idx) const {
-        return idx - hashtabele[hash_of(idx)].idx ;//idx to hashed-idx =)
+        auto hash = hash_of(idx);
+        auto index = hashtabele[hash].idx;
+        return (index == nullptr) ? MAX_OFFSET :  (idx - index);
     }
 
-    void register_chain_item(const uint8_t* idx) {
+    void register_chain_item(const uint8_t* idx, int distance = 0) {
         if (idx+CHECK_IP_END>=data_end) return;
         auto hash = hash_of(idx);
         //в хэш-таблице ссылка на следующий элемент в цепочке. там находится размется между текущем смещением и текущим.
@@ -126,7 +243,7 @@ class TokenSearcher {
             hash_item.next_item = CHAIN_BREAK;
             return;
         }
-        if ( hash_item.idx >= idx ) {
+        if ( hash_item.idx + distance >= idx ) {
             return;
         }
         uint16_t id = next_override_item;
@@ -142,108 +259,53 @@ class TokenSearcher {
         hash_item.next_item = id;
     }
 
-
-    void index() {
-        while (idxp < ip) {
-            #ifdef _USE_JUMP_OVER_MATCH
-            if (idxp < emitp) {
-                //индексируем на отвали матч
-                if (no_collision(idxp) || far_collision(idxp) >= 16 ) 
-                    register_chain_item(idxp); 
-                idxp++;
-                continue;
-            }
-            #endif
-
-            if (idxp == force_index_rle) {
-                //force_index_rle = nullptr;
-                register_chain_item(idxp);
-                idxp += match_len_simd(idxp, data_end, idxp+1, data_end) + 1;
-            }
-            else
-            if (is_rle(idxp)) {
-                //std::cerr << "RLE-skip-index: " << std::string_view((const char*)idxp, ENCODE_MIN) <<  std::endl;
-                if (no_collision(idxp) || far_collision(idxp) >= RLE_INDEX_DISTANCE ) 
-                    register_chain_item(idxp); 
-                idxp += match_len_simd(idxp, data_end, idxp+1 , data_end) + 1;
-            } 
-            else
-            if (is_rep2(idxp)) {
-                //std::cerr << "REP2-skip-index: " << std::string_view((const char*)idxp, ENCODE_MIN) <<  std::endl;
-                if (no_collision(idxp) || far_collision(idxp) >= REP2_INDEX_DISTANCE ) 
-                    register_chain_item(idxp); 
-                idxp += match_len_simd(idxp, data_end, idxp+2 , data_end) + 2;
-            }
-            else {
-                register_chain_item(idxp);
-                // if (idxp[0] == idxp[2] && idxp[1] == idxp[3])
-                //     idxp += match_len_simd(idxp,data_end, idxp+2, data_end)+2;
-                // else
-                    idxp++;
-            }
+    Best index_rle_search() {
+        Best rle{};
+        index();
+#ifdef _ENABLE_RLE
+        if (is_rle(ip)) {
+            if (no_collision(ip))
+                force_index_rle = ip;
+            rle.len = match_len_simd(ip, data_end, idxp+1, data_end);
+            idxp = ip + 1 + rle.len;
+            rle.ofs = ip;
+            rle.ip2 = ip+1;
+            rle.optimize(emitp);
+        } 
+        else
+        if (is_rep2(ip)) {
+            if (no_collision(ip))
+                force_index_rle = ip;
+            rle.len = match_len_simd(ip, data_end, idxp+2, data_end);
+            idxp = ip + 2 + rle.len;
+            rle.ofs = ip;
+            rle.ip2 = ip+2;
+            rle.optimize(emitp);
         }
+        if (rle.gain >= RLE_INDEX_TRIGGER) {
+            force_index_rle = ip;
+            return rle;
+        }
+#endif
+        return search_best(rle);
     }
 
-    struct Best{
-        const uint8_t* ofs{};
-        const uint8_t* ip2{};
-        int len{};
-        int gain{std::numeric_limits<int>::min()};
-
-        auto test_ofs() const {
-            return std::distance( ofs , ip2);
+    void index() {
+        if (force_index_rle != nullptr) {
+           register_chain_item(force_index_rle, RLE_INDEX_DISTANCE);
+           force_index_rle = nullptr;
         }
-        auto test_short() const {
-            return test_ofs() < (1<<10);
-        }
-        auto is_short(const TokenSearcher& ctx) const {
-            auto literal_len = std::distance(ctx.emitp,ip2);
-            return len >= ENCODE_MIN && test_short() && (literal_len <= 3);
-        }
-
-        void set_to_literals(const TokenSearcher& ctx) {
-             auto literal_len = std::distance(ctx.emitp,ip2);
-             len = 0;
-             gain = -2 /*cost*/ - literal_len - (literal_len + 255 - 31) / 255;
-        }
-
-        void optimize(const TokenSearcher& ctx) {
-            assert(ip2 >= ctx.emitp);
-            if (len < ENCODE_MIN || test_ofs() > MAX_OFFSET) {
-                set_to_literals(ctx);
-                return;
+        #if _USE_JUMP_OVER_MATCH > 0
+            while (idxp + _USE_JUMP_OVER_MATCH < emitp) {
+                register_chain_item(idxp);
+                idxp += _USE_JUMP_OVER_MATCH;
             }
-            if (len == 7+ENCODE_MIN) {
-                len--; //  std::cerr << "optimzation len==11 is useless" << std::endl;
-            }
-            assert(test_ofs() > 0);
-            auto literal_len = std::distance(ctx.emitp,ip2);
-            assert(literal_len >= 0);
-            // euristic optimization
-            int cost;
-            if (test_short() && literal_len <= 3) {
-                cost =  2 + match_cost(len);
-            } else
-                cost = 3 + literal_cost(literal_len) + match_cost(len);
-            gain = len - cost - literal_len;
-            
-            //add a little bit gain to keep literals in range 3
-            if (test_short() && literal_len <= 3)
-                gain += 1;
+        #endif
+        while (idxp < ip) {
+            register_chain_item(idxp);
+            idxp++;
         }
-
-        static int literal_cost(unsigned long nlit)
-        {
-            return (nlit + 255 - 7) / 255;
-        }
-
-        static int match_cost(unsigned long len)
-        {
-            return (len + 255 - ENCODE_MIN - 7) / 255;
-        }
-
-    };
-
+    }
 
     public:
     TokenSearcher(const uint8_t* begin, const uint8_t* end, Put_function put) : put(put), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE,HashItem{}), chaintable(CHAIN_SIZE,ChainItem{}) {}
@@ -271,10 +333,9 @@ class TokenSearcher {
     }
 
     void compress() {
-        ip+=1;
         if (ip > data_end) {
-            ip = data_end;
-        };
+            return;
+        }
         for (;;)
         {
             if (ip + CHECK_IP_END > data_end){
@@ -282,17 +343,17 @@ class TokenSearcher {
                 emit();
                 break;
             }
-            Best match = search_best();
+            Best match = index_rle_search();
             if (match.len < ENCODE_MIN) {
                 ip++;
                 continue;
             }
-
 #if LOOK_AHEAD > 0
             if (match.gain  < LOOK_AHEAD_ACCEPTABLE_GAIN) {          
                 auto ip_last = emitp+LOOK_AHEAD;
                 if (ip_last+CHECK_IP_END <= data_end && ip+1 <= ip_last) {
-                    uint32_t p_m, pp_m = match_of(ip);
+                    uint32_t p_m, pp_m;
+                    p_m = pp_m = match_of(ip);
                     ++ip;
                     for (; ip <= ip_last; ip++) {
                         auto m = match_of(ip);
@@ -300,126 +361,26 @@ class TokenSearcher {
                             break;
                         }
                         pp_m = p_m; p_m = m;
-                        if (no_collision(ip))//fast-skip
-                            continue;
                         auto next_match = search_best();
                         if (next_match.gain > match.gain) {
                             match = next_match;
-                        } 
+                        } else 
+                           if (match.gain >= LOOK_AHEAD_ACCEPTABLE_GAIN) {
+                            break;
+                        }
                     }
                 }
             }
 #endif
-
             emit(match);
         }
 
     }
 
-    inline int match_len_simd(const uint8_t* a, const uint8_t* a_end,const uint8_t* b, const uint8_t* b_end) {
-        int len = 0;
-        #ifdef _USE_SIMD
-        while (a + 16 <= a_end && b + 16 <= b_end) {
-            __m128i va = _mm_loadu_si128((__m128i*)a);
-            __m128i vb = _mm_loadu_si128((__m128i*)b);
-            __m128i cmp = _mm_cmpeq_epi8(va, vb);
-            int mask = _mm_movemask_epi8(cmp);
-            if (mask != 0xFFFF) {
-                return len + __builtin_ctz(~mask); // первая разница
-            }
-            len += 16;
-            a += 16;
-            b += 16;
-        }
-        #endif
-        // добить хвост
-        while (a < a_end && b < b_end && *a == *b) {
-            ++a; ++b; ++len;
-        }
-        return len;
-    }
-
-    inline int match_len_simd_backward(const uint8_t* a_begin, const uint8_t* a, const uint8_t* b_begin, const uint8_t* b) {
-        int len = 0;
-        #ifdef _USE_SIMD
-        while (a - 15 >= a_begin && b - 15 >= b_begin) {
-            __m128i va = _mm_loadu_si128((const __m128i*)(a - 15));
-            __m128i vb = _mm_loadu_si128((const __m128i*)(b - 15));
-            __m128i cmp = _mm_cmpeq_epi8(va, vb);
-            int mask = _mm_movemask_epi8(cmp);
-
-            if (mask != 0xFFFF) {
-                // Ищем первую единицу с конца mask (0 = несовпадение)
-                // Развернём маску для использования __builtin_clz
-                uint32_t inv_mask = (~mask) & 0xFFFF;
-                int leading_zeros = __builtin_clz(inv_mask) - 16; // mask в младших 16 битах
-                return len + leading_zeros;
-            }
-
-            len += 16;
-            a -= 16;
-            b -= 16;
-        }
-        #endif
-
-        while (a >= a_begin && b >= b_begin && *a == *b) {
-            --a;
-            --b;
-            ++len;
-        }
-
-        return len;
-    }
-
-    Best search_best() {
-        Best best{};
+    Best search_best(Best best={}, int nbAttemptsMax=MAX_ATTEMPTS) const {
         uint16_t hash;
         const uint8_t* idx;
         int next_item;
-        auto nbAttemptsMax{MAX_ITER_SCAN};
-
-        index();
-
-        if (is_rle(ip)) {
-            auto len = match_len_simd(ip+1, data_end, ip, data_end)+1;
-            auto backlen = match_len_simd_backward(data_begin,ip-1,emitp, ip);
-            auto rle_len = len + backlen;
-            auto rle_ofs = ip - backlen;
-            #if RLE_INDEX_TRIGGER > 0
-            //1: index this RLE if it is long enough or if there is no hash collision
-            if (rle_len >= RLE_INDEX_TRIGGER /*|| (rle_len >= ENCODE_MIN && no_collision(rle_ofs))*/) {
-                force_index_rle = rle_ofs;
-            }
-            #endif
-
-            //2: create RLE match (self-reference match)
-            best.ofs = rle_ofs;
-            best.ip2 = rle_ofs + 1;
-            best.len = rle_len - 1;
-            best.optimize(*this);
-            if (best.gain >= RLE_ACCEPTABLE_GAIN)
-                return best;
-
-        }
-        #ifdef _USE_FAST_SKIP
-        else {
-            auto fast_skip_len = 0;
-      
-            while (no_collision(ip)) {
-                ip++;
-                if (ip+CHECK_IP_END > data_end)
-                    return best;
-                if (ip-emitp > 16)
-                    return best;
-                fast_skip_len++;
-
-            }
-            // if (fast_skip_len > 0) {
-            //      std::cerr << "fast skip: " << std::string_view((const char*)ip-fast_skip_len, fast_skip_len) << std::endl;
-            // }
-        }
-        #endif
-
         for (int nbAttempts=0; nbAttempts < nbAttemptsMax; nbAttempts++)
         {
             if (nbAttempts == 0) {
@@ -470,7 +431,7 @@ class TokenSearcher {
             //assert(it + match <= ip2);
 
             Best after{idx, ip2, match_len };
-            after.optimize(*this);
+            after.optimize(emitp);
 
             if (after.gain > best.gain) {
                 best = after;
@@ -484,11 +445,154 @@ class TokenSearcher {
 };
 
 
-inline void lz_comp(const uint8_t*  begin, const uint8_t*  end, Put_function put) {
+inline void compress(const uint8_t*  begin, const uint8_t*  end, Put_function put) {
     auto current = begin;
     int plain_len = 0;
     auto ts = TokenSearcher(begin, end,put);
     ts.compress();
+}
+
+/* expand operators */
+using Put_bytes = std::function<void(uint32_t fetch, int n)>;
+using Move_bytes = std::function<void(int offset , int len)>;
+using Copy_bytes = std::function<void(const uint8_t* src, int len)>;
+using Fill_pattern = std::function<void(int pattern_size, uint32_t pattern,int count)>;
+
+void expand(const uint8_t*  begin, const uint8_t*  end, Put_bytes put, Move_bytes move, Copy_bytes copy, Fill_pattern fill_pattern) {
+    std::vector<uint8_t> out;
+    out.reserve(1 << 20);
+    auto in = begin;
+    uint32_t value32;
+    int bytes_available=0;
+
+    auto fetch = [&]() {
+        in -= bytes_available;
+        if ( end - in >= 4) {
+            bytes_available = 4;
+            value32 = reinterpret_cast<const uint32_t*>(in)[0];
+            in += 4;
+            return;
+        }
+        value32 = 0;
+        bytes_available = end - in;
+        switch (bytes_available) {
+            case 1:  value32 = in[0]; break;
+            case 2:  value32 = in[0] | (in[1] << 8); break;
+            case 3:  value32 = in[0] | (in[1] << 8) | (in[2] << 16); break;
+        }
+        in += bytes_available;
+    };
+    auto get8_safe = [&]() -> uint8_t {
+        if (bytes_available == 0) {
+            fetch();
+        }
+        uint8_t r = value32 & 0xFF;
+        value32 >>= 8;
+        bytes_available--;
+        return r;
+    };
+    auto skip = [&](int count) {
+        bytes_available -= count;
+        value32 >>= count * 8;
+    };
+
+
+    for (;; ){
+        fetch();
+        if (value32 == 0) {
+            return;
+        }
+        auto token = get8_safe();
+
+        if (token & 0x80) {
+            //short
+            //1_xx_LL_MMM xxxx_xxxx
+            int match_len = token & 0x7;
+            int literals_len = (token >> 3) & 0x3;
+            int ofs = ((token << 3) & 0x300);
+            uint32_t litval{0};
+            if (literals_len > 0) {
+                litval = value32 & ( (1 << (literals_len * 8)) - 1);
+                skip(literals_len);
+            }
+            ofs |= get8_safe();
+
+            if (match_len == 7) {
+                for(;;) {
+                    const auto chunk = get8_safe();
+                    match_len += chunk;
+                    if (chunk != 255) break;
+                }
+            }
+            if (ofs == 0 ) {
+                //offset == 0:
+                //   LL == 0:  literal match_len count
+                //   LL == 1:  rle x * match_len
+                //   LL == 2:  rle xy * match_len
+                //   LL == 3:  rle xyz * match_len
+                switch (literals_len) {
+                    case 0:
+                        if (bytes_available >= match_len) {
+                            put(value32, match_len);
+                            skip(match_len);
+                        } else {
+                            in -= bytes_available; bytes_available = 0;
+                            copy(in, match_len  );
+                            in += match_len;
+                        }
+                        break;
+                    case 1:
+                    case 2:
+                    case 3:
+                        fill_pattern(literals_len, litval, match_len);
+                        break;
+                }
+            }
+            else {
+                if (literals_len > 0)
+                    put(litval, literals_len);
+                match_len += ENCODE_MIN;
+                move(ofs, match_len );
+            }
+
+        } else {
+            //0_x_LLL_MMM xxxx_xxxx xxxx_xxxx
+            int literals_len = (token >> 3) & 0x7;
+            int match_len = token & 0x7;
+            if (literals_len == 7) {
+                for(;;) {
+                    const auto chunk = get8_safe();
+                    literals_len += chunk;
+                    if (chunk != 255) break;
+                }
+            }
+            if (bytes_available >= literals_len) {
+                put(value32, literals_len);
+                skip(literals_len);
+            } else {
+                in -= bytes_available; bytes_available = 0;
+                copy(in, literals_len);
+                in += literals_len;
+            }
+            int ofs = get8_safe();
+            ofs |= get8_safe() << 8;
+            ofs |= (token <<  (-6+16)) & 0x10000;
+            if (match_len == 7) {
+                for(;;) {
+                    const auto chunk = get8_safe();
+                    match_len += chunk;
+                    if (chunk != 255) break;
+                }
+            }
+            match_len += ENCODE_MIN;
+            move(ofs, match_len );
+
+        }
+
+    }
+
+}
+
 }
 
 
