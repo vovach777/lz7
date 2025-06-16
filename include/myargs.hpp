@@ -321,7 +321,7 @@ class Args
    template<typename T, typename K, typename = decltype( __get_n_str(std::declval<K>(),0, std::declval<T>() ))  >
    std::string_view get_n(K&& opt, int index, T && default_v)
    {
-      return get_n_str(std::forward<K>(opt),index,std::forwqard<T>(default_v));
+      return get_n_str(std::forward<K>(opt),index,std::forward<T>(default_v));
    }
 
    template<typename T, typename K, typename = decltype( __get_n_str(std::declval<K>(),0, std::declval<T>() ))  >

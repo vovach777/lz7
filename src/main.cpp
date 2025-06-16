@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <filesystem>
 #ifdef _WIN32
@@ -21,13 +22,13 @@ namespace fs = std::filesystem;
 
 inline void createEmptyFile(const char * fileName, int64_t fileSize) {
     FILE *fp=fopen(fileName, "w");
-    _chsize_s(_fileno(fp),fileSize);
+    _chsize_s(fileno(fp),fileSize);
     fclose(fp);
 }
 
 inline void extendFile(const char * fileName, int64_t fileSize) {
     FILE *fp=fopen(fileName, "r+");
-    _chsize_s(_fileno(fp),fileSize);
+    _chsize_s(fileno(fp),fileSize);
     fclose(fp);
 }
 
