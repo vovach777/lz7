@@ -19,6 +19,7 @@ fc 2-gen.log 2-dec.log >>results.txt
 fc 3-gen.log 3-dec.log >>results.txt
 fc 4-gen.log 4-dec.log >>results.txt
 fc 5-gen.log 5-dec.log >>results.txt
+..\build\lz7.exe "..\samples\sqlite3.c"
 ..\build\lz7parser.exe "..\samples\sqlite3.c" 2>"sqlite3.c.log"
 ..\build\lz7dec.exe "..\samples\sqlite3.c.lz7" 2>"sqlite3.c.lz7.log"  
 fc sqlite3.c.log sqlite3.c.lz7.log >>results.txt

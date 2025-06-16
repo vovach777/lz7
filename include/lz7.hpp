@@ -463,6 +463,7 @@ namespace lz7
                 else
                     ip += 1;
             }
+            ip = data_end;
             emit();
         }
 
