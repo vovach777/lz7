@@ -17,7 +17,7 @@
 #define RLE_INDEX_DISTANCE 0x1000
 #define REP2_INDEX_DISTANCE 0x1000
 #define RLE_ACCEPTABLE_GAIN 0x1000
-#define BEST_ACCEPTABLE_GAIN 0x1000
+#define BEST_ACCEPTABLE_GAIN 8
 #define LOOK_AHEAD_ACCEPTABLE_GAIN 0x1000
 // #define _USE_FAST_SKIP
 #define _USE_JUMP_OVER_MATCH 0
@@ -113,7 +113,7 @@ namespace lz7
         __m128i result = _mm_packus_epi32(shifted, shifted);
 
         // Сохранить результат в массив hash
-        _mm_storeu_si128(reinterpret_cast<__m128i *>(hashes), result);
+        _mm_storel_epi64(reinterpret_cast<__m128i *>(hashes), result);
     }
 
     inline int match_len_simd(const uint8_t *a, const uint8_t *a_end, const uint8_t *b, const uint8_t *b_end)
@@ -263,7 +263,7 @@ namespace lz7
             uint16_t next_item{CHAIN_BREAK};
             uint16_t offset_relative{0xFFFF};
         };
-        std::vector<HashItem> hashtabele; // index to chain
+        std::vector<HashItem> hashtable; // index to chain
         std::vector<ChainItem> chaintable;
         uint16_t next_override_item{0};
         const uint8_t *data_begin;
@@ -276,14 +276,14 @@ namespace lz7
 
         inline bool no_collision(const uint8_t *idx) const
         {
-            idx = hashtabele[hash_of(idx)].idx; // idx to hashed-idx =)
+            idx = hashtable[hash_of(idx)].idx; // idx to hashed-idx =)
             return idx == nullptr || (emitp - idx) > MAX_OFFSET;
         }
 
         inline auto far_collision(const uint8_t *idx) const
         {
             auto hash = hash_of(idx);
-            auto index = hashtabele[hash].idx;
+            auto index = hashtable[hash].idx;
             return (index == nullptr) ? MAX_OFFSET : (idx - index);
         }
 
@@ -293,7 +293,7 @@ namespace lz7
                 return;
             auto hash = hash_of(idx);
             // в хэш-таблице ссылка на следующий элемент в цепочке. там находится размется между текущем смещением и текущим.
-            auto &hash_item = hashtabele[hash];
+            auto &hash_item = hashtable[hash];
             if (hash_item.idx == nullptr)
             {
                 hash_item.idx = idx;
@@ -316,12 +316,12 @@ namespace lz7
             hash_item.idx = idx;
             hash_item.next_item = id;
         }
-        void register_chain_item(const uint8_t *idx, const uint16_t* hashes, int distance = 0)
+        inline void register_chain_item(const uint8_t *idx, const uint16_t* hashes, int distance = 0, int nb=4)
         {
-            for (int i = 0; i < 4; i++, idx++, hashes++)
+            for (int i = 0; i < nb; i++, idx++, hashes++)
             {
                 // в хэш-таблице ссылка на следующий элемент в цепочке. там находится размется между текущем смещением и текущим.
-                auto &hash_item = hashtabele[*hashes];
+                auto &hash_item = hashtable[*hashes];
                 if (hash_item.idx == nullptr)
                 {
                     hash_item.idx = idx;
@@ -376,7 +376,7 @@ namespace lz7
                 return rle;
             }
 #endif
-            return search_best(rle);
+            return search_best( hashtable[hash_of(ip)], rle);
         }
 
         void index()
@@ -401,7 +401,7 @@ namespace lz7
         }
 
     public:
-        TokenSearcher(const uint8_t *begin, const uint8_t *end, Put_function put) : put(put), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtabele(HASH_SIZE, HashItem{}), chaintable(CHAIN_SIZE, ChainItem{}) {}
+        TokenSearcher(const uint8_t *begin, const uint8_t *end, Put_function put) : put(put), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtable(HASH_SIZE, HashItem{}), chaintable(CHAIN_SIZE, ChainItem{}) {}
 
         void emit(const Best &best)
         {
@@ -427,118 +427,121 @@ namespace lz7
             }
         }
 
-        void compress_sse42()
-        {
-            alignas(32) uint16_t hashes[8]={0};
-            while (ip + 7 <= data_end)
-            {
-                hash_of_sse42(ip, hashes);
-
-                auto best = search_best();
-                ip += 1;
-                if (hashes[0] != hashes[1] )
-                    best = search_best(best);
-                ip += 1;
-                if (hashes[0] != hashes[2] && hashes[1] != hashes[2] )
-                    best = search_best(best);
-                ip += 1;
-                if (hashes[0] != hashes[3] && hashes[1] != hashes[3] != 0 && hashes[2] != hashes[3])
-                    best = search_best(best);
-                ip += 1;
-                register_chain_item(ip-4, hashes);
-                if (best.len >= ENCODE_MIN)
-                {
-                    emit(best);
-
-                } 
-               
-            }
-        }
 
         void compress()
         {
-            compress_sse42();
-            if (ip > data_end)
+            alignas(16) uint16_t hashes[4];
+            while (ip + 7 <= data_end)
             {
-                return;
+                while (idxp+4 < ip)
+                {
+                    hash_of_sse42(idxp, hashes);
+                    register_chain_item(idxp, hashes,2);
+                    idxp+=4;
+                }
+
+                hash_of_sse42(ip, hashes);
+
+                auto best = search_best(hashtable[ hashes[0] ], {});
+                ip += 1;
+                if (hashes[0] != hashes[1] )
+                    best = search_best(hashtable[ hashes[1] ],best);
+                ip += 1;
+                if (hashes[0] != hashes[2] && hashes[1] != hashes[2] )
+                    best = search_best(hashtable[ hashes[2] ],best);
+                ip += 1;
+                if (hashes[0] != hashes[3]  && hashes[1] != hashes[3]  && hashes[2] != hashes[3])
+                    best = search_best(hashtable[ hashes[3] ], best);
+                ip += 1;
+                if (best.len >= ENCODE_MIN)
+                    emit(best);
             }
-            for (;;)
-            {
-                if (ip + CHECK_IP_END > data_end)
-                {
-                    ip = data_end;
-                    emit();
-                    break;
-                }
-                Best match = index_rle_search();
-                if (match.len < ENCODE_MIN)
-                {
-                    ip++;
-                    continue;
-                }
-#if LOOK_AHEAD > 0
-                if (match.gain < LOOK_AHEAD_ACCEPTABLE_GAIN)
-                {
-                    auto ip_last = emitp + LOOK_AHEAD;
-                    if (ip_last + CHECK_IP_END <= data_end && ip + 1 <= ip_last)
-                    {
-                        uint32_t p_m, pp_m;
-                        p_m = pp_m = match_of(ip);
-                        ++ip;
-                        for (; ip <= ip_last; ip++)
-                        {
-                            auto m = match_of(ip);
-                            if (m == p_m || m == pp_m)
-                            {
-                                break;
-                            }
-                            pp_m = p_m;
-                            p_m = m;
-                            auto next_match = search_best();
-                            if (next_match.gain > match.gain)
-                            {
-                                match = next_match;
-                            }
-                            else if (match.gain >= LOOK_AHEAD_ACCEPTABLE_GAIN)
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-#endif
-                emit(match);
+            while (ip + 4 <= data_end) {
+                auto best = search_best(hashtable[ hash_of(ip) ], {});
+                if (best.len >= ENCODE_MIN)
+                    emit(best);
+                else
+                    ip += 1;
             }
+            emit();
         }
 
-        Best search_best(Best best = {}, int nbAttemptsMax = MAX_ATTEMPTS) const
+//         void compress()
+//         {
+//             compress_sse42();
+//             if (ip > data_end)
+//             {
+//                 return;
+//             }
+//             for (;;)
+//             {
+//                 if (ip + CHECK_IP_END > data_end)
+//                 {
+//                     ip = data_end;
+//                     emit();
+//                     break;
+//                 }
+//                 Best match = index_rle_search();
+//                 if (match.len < ENCODE_MIN)
+//                 {
+//                     ip++;
+//                     continue;
+//                 }
+// #if LOOK_AHEAD > 0
+//                 if (match.gain < LOOK_AHEAD_ACCEPTABLE_GAIN)
+//                 {
+//                     auto ip_last = emitp + LOOK_AHEAD;
+//                     if (ip_last + CHECK_IP_END <= data_end && ip + 1 <= ip_last)
+//                     {
+//                         uint32_t p_m, pp_m;
+//                         p_m = pp_m = match_of(ip);
+//                         ++ip;
+//                         for (; ip <= ip_last; ip++)
+//                         {
+//                             auto m = match_of(ip);
+//                             if (m == p_m || m == pp_m)
+//                             {
+//                                 break;
+//                             }
+//                             pp_m = p_m;
+//                             p_m = m;
+//                             auto next_match = search_best(hashtable[hash_of(ip)], match);
+//                             if (next_match.gain > match.gain)
+//                             {
+//                                 match = next_match;
+//                             }
+//                             else if (match.gain >= LOOK_AHEAD_ACCEPTABLE_GAIN)
+//                             {
+//                                 break;
+//                             }
+//                         }
+//                     }
+//                 }
+// #endif
+//                 emit(match);
+//             }
+//         }
+
+        Best search_best(HashItem hash_item, Best best = {}, int nbAttemptsMax = MAX_ATTEMPTS) const
         {
-            uint16_t hash;
-            const uint8_t *idx;
-            int next_item;
+            // bool is_literal_packet = ip - emitp > 3;
+            // if ( is_literal_packet && best.len >= ENCODE_MIN)
+            //     return best;
+            // if (best.gain > BEST_ACCEPTABLE_GAIN)
+            //     return best;
+            const uint8_t *idx{hash_item.idx};
+            if (idx == nullptr)
+                return best;
+            int next_item = hash_item.next_item;
             for (int nbAttempts = 0; nbAttempts < nbAttemptsMax; nbAttempts++)
             {
-                if (nbAttempts == 0)
-                {
-                    hash = hash_of(ip);
-                    auto &hash_item = hashtabele[hash];
-                    idx = hash_item.idx;
-                    if (idx == nullptr)
-                        break;
-                    next_item = hash_item.next_item;
-                }
-                else
+                if (nbAttempts > 0)
                 {
                     if (next_item == CHAIN_BREAK)
                         break;
                     auto &chain_item = chaintable[next_item];
-                    // if ( chain_item.offset_relative == 0xFFFF) {
-                    //     break;
-                    // }
                     idx -= chain_item.offset_relative;
-                    if (idx < data_begin)
-                        break;
-                    if (hash_of(idx) != hash)
+                    if (idx < data_begin || (emitp-idx > MAX_OFFSET))
                         break;
                     next_item = chain_item.next_item;
                 }
@@ -546,6 +549,7 @@ namespace lz7
                 // fast skip
                 if (idx >= ip)
                     continue;
+
 #ifdef _USE_mismatch
                 auto [it_mismatch, ip_mismatch] = std::mismatch(it, data_end, ip, data_end);
                 int match_len = std::distance(it, it_mismatch);
@@ -553,11 +557,11 @@ namespace lz7
                 auto match_len = match_len_simd(ip, data_end, idx, data_end);
 #endif
 
-                if (match_len < ENCODE_MIN)
+                if (match_len < ENCODE_MIN) {
+                    if (hash_of(idx) != hash_of(ip))
+                        break;
                     continue;
-                // if (it_mismatch > ip) {
-                //   //  std::cerr << "self-ref: " <<  it_mismatch-ip <<   std::endl;
-                // }
+                }
 
                 int back_match_len = match_len_simd_backward(data_begin, idx - 1, emitp, ip - 1);
                 auto ip2 = ip - back_match_len;
@@ -574,10 +578,11 @@ namespace lz7
                 if (after.gain > best.gain)
                 {
                     best = after;
+                    // if (best.is_short(emitp))
+                    //     break;
+
                     // std::cerr << " gain search step: " << (best.gain - after.gain) << std::endl;
                 }
-                else if (best.gain >= BEST_ACCEPTABLE_GAIN)
-                    break;
             }
             return best;
         }
