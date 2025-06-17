@@ -1,3 +1,4 @@
+// https://godbolt.org/z/1fd69Ez7W
 #ifndef LZ7_H
 #define LZ7_H
 
@@ -12,17 +13,17 @@
 #define CHAIN_LOG2 (16)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
 #define CHAIN_BREAK (CHAIN_SIZE - 1)
-#define LOOK_AHEAD (2)
-#define RLE_INDEX_TRIGGER 10
-#define RLE_INDEX_DISTANCE 0x1000
-#define REP2_INDEX_DISTANCE 0x1000
-#define RLE_ACCEPTABLE_GAIN 0x1000
-#define BEST_ACCEPTABLE_GAIN 8
-#define LOOK_AHEAD_ACCEPTABLE_GAIN 0x1000
-// #define _USE_FAST_SKIP
-#define _USE_JUMP_OVER_MATCH 0
-// #define _ENABLE_RLE
-#define CHECK_IP_END (sizeof(uint32_t))
+// #define LOOK_AHEAD (2)
+// #define RLE_INDEX_TRIGGER 10
+// #define RLE_INDEX_DISTANCE 0x1000
+// #define REP2_INDEX_DISTANCE 0x1000
+// #define RLE_ACCEPTABLE_GAIN 0x1000
+// #define BEST_ACCEPTABLE_GAIN 8
+// #define LOOK_AHEAD_ACCEPTABLE_GAIN 0x1000
+// // #define _USE_FAST_SKIP
+// #define _USE_JUMP_OVER_MATCH 0
+// // #define _ENABLE_RLE
+// #define CHECK_IP_END (sizeof(uint32_t))
 #if CHAIN_LOG2 > 16
 #error "CHAIN_LOG2 > chain is uint16_t only"
 #endif
@@ -388,18 +389,6 @@ namespace lz7
                     if ((h != nullptr) && (h->idx != nullptr))
                         search_best(*h, match);
                     ip += 1;
-                    // ip += 1;
-                    // if (hashes[0] != hashes[1] )
-                    //     best = search_best(hashtable[ hashes[1] ],best);
-                    // ip += 1;
-                    // if (hashes[0] != hashes[2] && hashes[1] != hashes[2] )
-                    //     best = search_best(hashtable[ hashes[2] ],best);
-                    // ip += 1;
-                    // if (hashes[0] != hashes[3]  && hashes[1] != hashes[3]  && hashes[2] != hashes[3])
-                    //     best = search_best(hashtable[ hashes[3] ], best);
-                    // ip += 1;
-                    // if (best.len >= ENCODE_MIN)
-                    //     emit(best);
                 }
                 if (match) {
                     emit(match);
@@ -417,69 +406,8 @@ namespace lz7
             emit();
         }
 
-//         void compress()
-//         {
-//             compress_sse42();
-//             if (ip > data_end)
-//             {
-//                 return;
-//             }
-//             for (;;)
-//             {
-//                 if (ip + CHECK_IP_END > data_end)
-//                 {
-//                     ip = data_end;
-//                     emit();
-//                     break;
-//                 }
-//                 Best match = index_rle_search();
-//                 if (match.len < ENCODE_MIN)
-//                 {
-//                     ip++;
-//                     continue;
-//                 }
-// #if LOOK_AHEAD > 0
-//                 if (match.gain < LOOK_AHEAD_ACCEPTABLE_GAIN)
-//                 {
-//                     auto ip_last = emitp + LOOK_AHEAD;
-//                     if (ip_last + CHECK_IP_END <= data_end && ip + 1 <= ip_last)
-//                     {
-//                         uint32_t p_m, pp_m;
-//                         p_m = pp_m = match_of(ip);
-//                         ++ip;
-//                         for (; ip <= ip_last; ip++)
-//                         {
-//                             auto m = match_of(ip);
-//                             if (m == p_m || m == pp_m)
-//                             {
-//                                 break;
-//                             }
-//                             pp_m = p_m;
-//                             p_m = m;
-//                             auto next_match = search_best(hashtable[hash_of(ip)], match);
-//                             if (next_match.gain > match.gain)
-//                             {
-//                                 match = next_match;
-//                             }
-//                             else if (match.gain >= LOOK_AHEAD_ACCEPTABLE_GAIN)
-//                             {
-//                                 break;
-//                             }
-//                         }
-//                     }
-//                 }
-// #endif
-//                 emit(match);
-//             }
-//         }
-
         void search_best(const HashItem& hash_item, Best &best, int nbAttemptsMax = MAX_ATTEMPTS) const
         {
-            // bool is_literal_packet = ip - emitp > 3;
-            // if ( is_literal_packet && best.len >= ENCODE_MIN)
-            //     return best;
-            // if (best.gain > BEST_ACCEPTABLE_GAIN)
-            //     return best;
             const uint8_t *idx{hash_item.idx};
             if (idx == nullptr)
                 return;
@@ -548,10 +476,9 @@ namespace lz7
     using Copy_bytes = std::function<void(const uint8_t *src, int len)>;
     using Fill_pattern = std::function<void(int pattern_size, uint32_t pattern, int count)>;
 
-    void expand(const uint8_t *begin, const uint8_t *end, Put_bytes put, Move_bytes move, Copy_bytes copy, Fill_pattern fill_pattern)
+    inline void expand(const uint8_t *begin, const uint8_t *end, Put_bytes put, Move_bytes move, Copy_bytes copy, Fill_pattern fill_pattern)
     {
-        std::vector<uint8_t> out;
-        out.reserve(1 << 20);
+
         auto in = begin;
         uint32_t value32;
         int bytes_available = 0;
