@@ -188,15 +188,19 @@ namespace lz7
         int len{};
         int gain{std::numeric_limits<int>::min()};
 
-        int test_ofs() const
+        constexpr operator bool() const {
+            return len >= ENCODE_MIN;
+        }
+
+        constexpr int test_ofs() const
         {
             return std::distance(ofs, ip2);
         }
-        auto test_short() const
+        constexpr auto test_short() const
         {
             return test_ofs() < (1 << 10);
         }
-        auto is_short(const uint8_t *emitp) const
+        constexpr auto is_short(const uint8_t *emitp) const
         {
             auto literal_len = std::distance(emitp, ip2);
             return len >= ENCODE_MIN && test_short() && (literal_len <= 3);
@@ -239,12 +243,12 @@ namespace lz7
                 gain += 1;
         }
 
-        static int literal_cost(unsigned long nlit)
+        constexpr int literal_cost(unsigned long nlit)
         {
             return (nlit + 255 - 7) / 255;
         }
 
-        static int match_cost(unsigned long len)
+        constexpr int match_cost(unsigned long len)
         {
             return (len + 255 - ENCODE_MIN - 7) / 255;
         }
@@ -272,7 +276,6 @@ namespace lz7
         const uint8_t *idxp;
         const uint8_t *emitp;
         Put_function put;
-        const uint8_t *force_index_rle{nullptr};
 
         inline bool no_collision(const uint8_t *idx) const
         {
@@ -287,49 +290,42 @@ namespace lz7
             return (index == nullptr) ? MAX_OFFSET : (idx - index);
         }
 
-        void register_chain_item(const uint8_t *idx, int distance = 0)
+        auto hash_of_4(const uint8_t *idx)
         {
-            if (idx + CHECK_IP_END >= data_end)
-                return;
-            auto hash = hash_of(idx);
-            // в хэш-таблице ссылка на следующий элемент в цепочке. там находится размется между текущем смещением и текущим.
-            auto &hash_item = hashtable[hash];
-            if (hash_item.idx == nullptr)
-            {
-                hash_item.idx = idx;
-                hash_item.next_item = CHAIN_BREAK;
-                return;
-            }
-            if (hash_item.idx + distance >= idx)
-            {
-                return;
-            }
-            uint16_t id = next_override_item;
-            if (id + 1 == CHAIN_BREAK)
-                next_override_item = 0; // round
-            else
-                next_override_item = id + 1;
-
-            auto &chain_item = chaintable[id];
-            chain_item.next_item = hash_item.next_item;
-            chain_item.offset_relative = std::min<ptrdiff_t>(0xFFFF, idx - hash_item.idx);
-            hash_item.idx = idx;
-            hash_item.next_item = id;
+            alignas(16) uint16_t hashes[4];
+            hash_of_sse42(idx, hashes);
+            return std::array{&hashtable[hashes[0]],&hashtable[hashes[1]], &hashtable[hashes[2]], &hashtable[hashes[3]]};
         }
-        inline void register_chain_item(const uint8_t *idx, const uint16_t* hashes, int distance = 0, int nb=4)
+
+        auto hash_of_4_with_filter(const uint8_t *idx)
         {
-            for (int i = 0; i < nb; i++, idx++, hashes++)
+            alignas(16) uint16_t hashes[4];
+            hash_of_sse42(idx, hashes);
+            return std::array{
+                &hashtable[hashes[0]],
+                hashes[1] == hashes[0] ? nullptr : &hashtable[hashes[1]],
+                hashes[2] == hashes[1] || hashes[2] == hashes[0] ? nullptr :  &hashtable[hashes[2]],
+                hashes[3] == hashes[2] || hashes[3] == hashes[1] ||  hashes[3] == hashes[0] ? nullptr :  &hashtable[hashes[3]]
+            };
+
+        }
+
+
+        inline void register_chain_items( const uint8_t *idx)
+        {
+            for (auto h : hash_of_4(idx))
             {
                 // в хэш-таблице ссылка на следующий элемент в цепочке. там находится размется между текущем смещением и текущим.
-                auto &hash_item = hashtable[*hashes];
+                auto &hash_item = *h;
                 if (hash_item.idx == nullptr)
                 {
-                    hash_item.idx = idx;
+                    hash_item.idx = idx++;
                     hash_item.next_item = CHAIN_BREAK;
                     continue;
                 }
-                if (hash_item.idx + distance >= idx)
+                if (hash_item.idx + 8 >= idx)
                 {
+                    idx++;
                     continue;
                 }
                 uint16_t id = next_override_item;
@@ -341,64 +337,12 @@ namespace lz7
                 auto &chain_item = chaintable[id];
                 chain_item.next_item = hash_item.next_item;
                 chain_item.offset_relative = std::min<ptrdiff_t>(0xFFFF, idx - hash_item.idx);
-                hash_item.idx = idx;
+                hash_item.idx = idx++;
                 hash_item.next_item = id;
             }
         }
-        Best index_rle_search()
-        {
-            Best rle{};
-            index();
-#ifdef _ENABLE_RLE
-            if (is_rle(ip))
-            {
-                if (no_collision(ip))
-                    force_index_rle = ip;
-                rle.len = match_len_simd(ip, data_end, idxp + 1, data_end);
-                idxp = ip + 1 + rle.len;
-                rle.ofs = ip;
-                rle.ip2 = ip + 1;
-                rle.optimize(emitp);
-            }
-            else if (is_rep2(ip))
-            {
-                if (no_collision(ip))
-                    force_index_rle = ip;
-                rle.len = match_len_simd(ip, data_end, idxp + 2, data_end);
-                idxp = ip + 2 + rle.len;
-                rle.ofs = ip;
-                rle.ip2 = ip + 2;
-                rle.optimize(emitp);
-            }
-            if (rle.gain >= RLE_INDEX_TRIGGER)
-            {
-                force_index_rle = ip;
-                return rle;
-            }
-#endif
-            return search_best( hashtable[hash_of(ip)], rle);
-        }
 
-        void index()
-        {
-            if (force_index_rle != nullptr)
-            {
-                register_chain_item(force_index_rle, RLE_INDEX_DISTANCE);
-                force_index_rle = nullptr;
-            }
-#if _USE_JUMP_OVER_MATCH > 0
-            while (idxp + _USE_JUMP_OVER_MATCH < emitp)
-            {
-                register_chain_item(idxp);
-                idxp += _USE_JUMP_OVER_MATCH;
-            }
-#endif
-            while (idxp < ip)
-            {
-                register_chain_item(idxp);
-                idxp++;
-            }
-        }
+
 
     public:
         TokenSearcher(const uint8_t *begin, const uint8_t *end, Put_function put) : put(put), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtable(HASH_SIZE, HashItem{}), chaintable(CHAIN_SIZE, ChainItem{}) {}
@@ -430,36 +374,42 @@ namespace lz7
 
         void compress()
         {
-            alignas(16) uint16_t hashes[4];
             while (ip + 7 <= data_end)
             {
                 while (idxp+4 < ip)
                 {
-                    hash_of_sse42(idxp, hashes);
-                    register_chain_item(idxp, hashes,2);
+                    register_chain_items(idxp);
                     idxp+=4;
                 }
 
-                hash_of_sse42(ip, hashes);
-
-                auto best = search_best(hashtable[ hashes[0] ], {});
-                ip += 1;
-                if (hashes[0] != hashes[1] )
-                    best = search_best(hashtable[ hashes[1] ],best);
-                ip += 1;
-                if (hashes[0] != hashes[2] && hashes[1] != hashes[2] )
-                    best = search_best(hashtable[ hashes[2] ],best);
-                ip += 1;
-                if (hashes[0] != hashes[3]  && hashes[1] != hashes[3]  && hashes[2] != hashes[3])
-                    best = search_best(hashtable[ hashes[3] ], best);
-                ip += 1;
-                if (best.len >= ENCODE_MIN)
-                    emit(best);
+                Best match{};
+                for (auto h : hash_of_4_with_filter(ip))
+                {
+                    if ((h != nullptr) && (h->idx != nullptr))
+                        search_best(*h, match);
+                    ip += 1;
+                    // ip += 1;
+                    // if (hashes[0] != hashes[1] )
+                    //     best = search_best(hashtable[ hashes[1] ],best);
+                    // ip += 1;
+                    // if (hashes[0] != hashes[2] && hashes[1] != hashes[2] )
+                    //     best = search_best(hashtable[ hashes[2] ],best);
+                    // ip += 1;
+                    // if (hashes[0] != hashes[3]  && hashes[1] != hashes[3]  && hashes[2] != hashes[3])
+                    //     best = search_best(hashtable[ hashes[3] ], best);
+                    // ip += 1;
+                    // if (best.len >= ENCODE_MIN)
+                    //     emit(best);
+                }
+                if (match) {
+                    emit(match);
+                }
             }
             while (ip + 4 <= data_end) {
-                auto best = search_best(hashtable[ hash_of(ip) ], {});
-                if (best.len >= ENCODE_MIN)
-                    emit(best);
+                Best match{};
+                search_best(hashtable[ hash_of(ip) ], match);
+                if (match)
+                    emit(match);
                 else
                     ip += 1;
             }
@@ -523,7 +473,7 @@ namespace lz7
 //             }
 //         }
 
-        Best search_best(HashItem hash_item, Best best = {}, int nbAttemptsMax = MAX_ATTEMPTS) const
+        void search_best(const HashItem& hash_item, Best &best, int nbAttemptsMax = MAX_ATTEMPTS) const
         {
             // bool is_literal_packet = ip - emitp > 3;
             // if ( is_literal_packet && best.len >= ENCODE_MIN)
@@ -532,7 +482,7 @@ namespace lz7
             //     return best;
             const uint8_t *idx{hash_item.idx};
             if (idx == nullptr)
-                return best;
+                return;
             int next_item = hash_item.next_item;
             for (int nbAttempts = 0; nbAttempts < nbAttemptsMax; nbAttempts++)
             {
@@ -579,13 +529,8 @@ namespace lz7
                 if (after.gain > best.gain)
                 {
                     best = after;
-                    // if (best.is_short(emitp))
-                    //     break;
-
-                    // std::cerr << " gain search step: " << (best.gain - after.gain) << std::endl;
                 }
             }
-            return best;
         }
     };
 

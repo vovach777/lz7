@@ -7,12 +7,6 @@
 #include <cstdio>
 #include <functional>
 #include <filesystem>
-#ifdef _WIN32
-#include <io.h>
-#else
-#include <unistd.h>
-#define _chsize_s(d, s) ftruncate(d,s)
-#endif
 namespace fs = std::filesystem;
 #include "lz7.hpp"
 #include "mio.hpp"
@@ -20,16 +14,12 @@ namespace fs = std::filesystem;
 #include "myargs.hpp"
 
 
-inline void createEmptyFile(const char * fileName, int64_t fileSize) {
-    FILE *fp=fopen(fileName, "w");
-    _chsize_s(fileno(fp),fileSize);
-    fclose(fp);
+inline void createEmptyFile(const char * fileName) {
+    FILE *file = fopen(fileName, "wb");
 }
 
 inline void extendFile(const char * fileName, int64_t fileSize) {
-    FILE *fp=fopen(fileName, "r+");
-    _chsize_s(fileno(fp),fileSize);
-    fclose(fp);
+    fs::resize_file(fileName, fileSize);
 }
 
 using myargs::args;
@@ -161,13 +151,16 @@ int main(int argc, char** argv) {
         std::cout << "decompressing " <<  args[1]    << " into " << std::string(filename) << "..." << std::flush;
         int64_t base = 0;
         int64_t current_size = PgSize;
-        createEmptyFile(filename.data(), PgSize);
+        createEmptyFile(filename.data());
+        extendFile(filename.data(),current_size);
+
 
         auto rw_mmap = mio::make_mmap<mio::ummap_sink>(filename, base, current_size, error);
         if (error)
         {
             throw std::runtime_error(error.message());
         }
+        auto beg = rw_mmap.begin();
         auto it = rw_mmap.begin();
         auto end =  rw_mmap.end();
         auto chk_expand = [&](int size) {
@@ -175,14 +168,16 @@ int main(int argc, char** argv) {
                 auto global_it = it - rw_mmap.begin() + base;
                 auto global_window = std::max<int64_t>(0, global_it - MAX_OFFSET);
                 auto it_distance = global_it - global_window;
-                current_size = (it_distance + size + PgSize + PgSize -1) & ~(PgSize - 1);
+                current_size = (it_distance + size + PgSize -1) & ~(PgSize - 1);
                 base = global_window;
+                rw_mmap.unmap();
                 extendFile(filename.data(), base + current_size);
                 rw_mmap = mio::make_mmap<mio::ummap_sink>(filename, base, current_size, error);
                 if (error)
                 {
                     throw std::runtime_error(error.message());
                 }
+                beg = rw_mmap.begin();
                 it = rw_mmap.begin() + it_distance;
                 end = rw_mmap.end();
                 assert(it < end);
@@ -203,16 +198,32 @@ int main(int argc, char** argv) {
         //move function
         [&](int ofs, int len) {
             chk_expand(len);
-            //std::memcpy(it, it - ofs, len);
-            for (int i = 0; i < len; ++i) {
-                it[i] = it[i - ofs];
+            auto src = it - ofs;
+            if (src < beg) {
+                throw std::runtime_error("wrong offset - format broken!");
             }
-            it += len;
+            if (src + len > it ) {
+                std::copy(src, it, it);
+                int copy_len = it - src;
+                src = it;
+                it += copy_len;
+                int rest_len = len - copy_len;
+                for(;rest_len > 0; --rest_len)
+                {
+                    *it++ = *src++;
+                }
+            } else {
+               std::copy(src, src+len, it);
+               it += len;
+            }
+
+
         },
         //copy function
         [&](const uint8_t* src, int len) {
             chk_expand(len);
-            std::memcpy(it, src, len);
+            //std::memcpy(it, src, len);
+            std::copy(src,src+len,it);
             it += len;
         },
         //pattern dup function
