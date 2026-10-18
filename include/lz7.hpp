@@ -7,7 +7,15 @@
 #define MAX_OFFSET ((1 << 17) - 1)
 #define NO_MATCH_OFS (MAX_OFFSET)
 #define ENCODE_MIN (4)
-#define MAX_ATTEMPTS (16)
+// Глубина поиска по цепочке: жёсткий потолок и выход после MISS_STREAK кандидатов подряд
+// без улучшения. Дефолты подобраны по статистике Calgary/sqlite3.c/libstdc++:
+// лучший матч в 83-90% случаев находится за первые 8 кандидатов.
+#ifndef MAX_ATTEMPTS
+#define MAX_ATTEMPTS (256)
+#endif
+#ifndef MISS_STREAK
+#define MISS_STREAK (8)
+#endif
 #define HASH_LOG2 (16)
 #define HASH_SIZE (1 << HASH_LOG2)
 #define CHAIN_LOG2 (16)
@@ -26,6 +34,9 @@
 // #define CHECK_IP_END (sizeof(uint32_t))
 #if CHAIN_LOG2 > 16
 #error "CHAIN_LOG2 > chain is uint16_t only"
+#endif
+#if HASH_LOG2 > 16
+#error "HASH_LOG2 > 16: hashes are uint16_t (and _mm_packus_epi32 saturates)"
 #endif
 #include <algorithm>
 #include <cassert>
@@ -462,6 +473,7 @@ namespace lz7
             if (idx == nullptr)
                 return;
             int next_item = hash_item.next_item;
+            int misses = 0;
             for (int nbAttempts = 0; nbAttempts < nbAttemptsMax; nbAttempts++)
             {
                 if (nbAttempts > 0)
@@ -470,44 +482,50 @@ namespace lz7
                         break;
                     auto &chain_item = chaintable[next_item];
                     idx -= chain_item.offset_relative;
-                    if (idx < data_begin || (emitp-idx > MAX_OFFSET))
+                    if (idx < data_begin || (emitp - idx > MAX_OFFSET))
                         break;
                     next_item = chain_item.next_item;
                 }
-                // pre-hashing happens...
-                // fast skip
                 if (idx >= ip)
                     continue;
 
-#ifdef _USE_mismatch
-                auto [it_mismatch, ip_mismatch] = std::mismatch(it, data_end, ip, data_end);
-                int match_len = std::distance(it, it_mismatch);
-#else
-                auto match_len = match_len_simd(ip, data_end, idx, data_end);
-#endif
+                // быстрый отсев: кандидат не длиннее лучшего, если не совпал байт, на котором лучший кончается
+                if (best)
+                {
+                    auto k = best.ip2 + best.len - ip;
+                    if (k > 0 && ip + k < data_end && idx[k] != ip[k])
+                    {
+                        if (++misses >= MISS_STREAK)
+                            break;
+                        continue;
+                    }
+                }
 
-                if (match_len < ENCODE_MIN) {
+                auto match_len = match_len_simd(ip, data_end, idx, data_end);
+                if (match_len < ENCODE_MIN)
+                {
+                    // кольцо chaintable переиспользуется: чужой хэш значит, что дальше цепочка протухла
                     if (hash_of(idx) != hash_of(ip))
+                        break;
+                    if (++misses >= MISS_STREAK)
                         break;
                     continue;
                 }
 
+                // idx не трогаем: следующий шаг по цепочке отсчитывается от него
                 int back_match_len = match_len_simd_backward(data_begin, idx - 1, emitp, ip - 1);
-                auto ip2 = ip - back_match_len;
-                idx -= back_match_len;
-                match_len += back_match_len;
-
-                assert(ip2 >= emitp);
-                assert(idx >= data_begin);
-                // assert(it + match <= ip2);
-
-                Best after{idx, ip2, match_len};
+                Best after{idx - back_match_len, ip - back_match_len, match_len + back_match_len};
+                assert(after.ip2 >= emitp);
+                assert(after.ofs >= data_begin);
                 after.optimize(emitp);
 
                 if (after.gain > best.gain)
                 {
                     best = after;
+                    misses = 0;
                 }
+                else if (++misses >= MISS_STREAK)
+                    break;
             }
         }
     };
