@@ -16,6 +16,8 @@ namespace fs = std::filesystem;
 
 inline void createEmptyFile(const char * fileName) {
     FILE *file = fopen(fileName, "wb");
+    if (file)
+        fclose(file);
 }
 
 inline void extendFile(const char * fileName, int64_t fileSize) {
@@ -146,97 +148,57 @@ int main(int argc, char** argv) {
                 outstream.write((char*)out.data(), out.size());
         }
     } else {
-        constexpr int PgSize = (1 << 20);
-        //static_assert( PgSize > MAX_OFFSET );
+        constexpr int64_t PgSize = (1 << 20);
         std::cout << "decompressing " <<  args[1]    << " into " << std::string(filename) << "..." << std::flush;
+        sw.startnew();
+        // выход мапится окном [base, base + current_size); при нехватке места окно сдвигается,
+        // сохраняя MAX_OFFSET байт истории, и растёт геометрически
         int64_t base = 0;
         int64_t current_size = PgSize;
         createEmptyFile(filename.data());
-        extendFile(filename.data(),current_size);
-
-
+        extendFile(filename.data(), current_size);
         auto rw_mmap = mio::make_mmap<mio::ummap_sink>(filename, base, current_size, error);
         if (error)
         {
             throw std::runtime_error(error.message());
         }
-        auto beg = rw_mmap.begin();
-        auto it = rw_mmap.begin();
-        auto end =  rw_mmap.end();
-        auto chk_expand = [&](int size) {
-            if (it + size > end)  {
-                auto global_it = it - rw_mmap.begin() + base;
-                auto global_window = std::max<int64_t>(0, global_it - MAX_OFFSET);
-                auto it_distance = global_it - global_window;
-                current_size = (it_distance + size + PgSize -1) & ~(PgSize - 1);
-                base = global_window;
-                rw_mmap.unmap();
-                extendFile(filename.data(), base + current_size);
-                rw_mmap = mio::make_mmap<mio::ummap_sink>(filename, base, current_size, error);
-                if (error)
-                {
-                    throw std::runtime_error(error.message());
-                }
-                beg = rw_mmap.begin();
-                it = rw_mmap.begin() + it_distance;
-                end = rw_mmap.end();
-                assert(it < end);
+        const uint8_t *in = mmap.data();
+        const uint8_t *in_end = mmap.data() + mmap.size();
+        uint8_t *op = rw_mmap.begin();
+        for (;;)
+        {
+            auto r = lz7::decode(in, in_end, op, rw_mmap.end(), rw_mmap.begin());
+            in = r.in;
+            op = r.op;
+            if (r.status == lz7::DecodeStatus::Done)
+                break;
+            if (r.status == lz7::DecodeStatus::Error)
+            {
+                std::cerr << std::endl << "format broken: " << r.error << " at input offset " << (in - mmap.data()) << std::endl;
+                return 1;
             }
-        };
-
-
-        lz7::expand(mmap.data(), mmap.data()+mmap.size(),
-          //put function
-          [&](uint32_t value, int literals_len) {
-            //short literals
-            if (literals_len) {
-                chk_expand(4);
-                std::memcpy(it, &value, sizeof(value));
-                it += literals_len;
+            const int64_t global_op = base + (op - rw_mmap.begin());
+            const int64_t new_base = std::max<int64_t>(0, global_op - MAX_OFFSET);
+            const int64_t history = global_op - new_base;
+            const int64_t grow = std::max<int64_t>(r.need, std::clamp<int64_t>(global_op, PgSize, int64_t(1) << 30));
+            current_size = (history + grow + PgSize - 1) & ~(PgSize - 1);
+            base = new_base;
+            rw_mmap.unmap();
+            extendFile(filename.data(), base + current_size);
+            rw_mmap = mio::make_mmap<mio::ummap_sink>(filename, base, current_size, error);
+            if (error)
+            {
+                throw std::runtime_error(error.message());
             }
-        },
-        //move function
-        [&](int ofs, int len) {
-            chk_expand(len);
-            auto src = it - ofs;
-            if (src < beg) {
-                throw std::runtime_error("wrong offset - format broken!");
-            }
-            if (src + len > it ) {
-                std::copy(src, it, it);
-                int copy_len = it - src;
-                src = it;
-                it += copy_len;
-                int rest_len = len - copy_len;
-                for(;rest_len > 0; --rest_len)
-                {
-                    *it++ = *src++;
-                }
-            } else {
-               std::copy(src, src+len, it);
-               it += len;
-            }
-
-
-        },
-        //copy function
-        [&](const uint8_t* src, int len) {
-            chk_expand(len);
-            //std::memcpy(it, src, len);
-            std::copy(src,src+len,it);
-            it += len;
-        },
-        //pattern dup function
-        [&](int pattern_size, uint32_t pattern,int count) {
-            chk_expand(pattern_size * count);
-            std::memcpy(it, &pattern, sizeof(pattern));
-            std::memmove(it + pattern_size, it, (count-1)*pattern_size);
-            it += count*pattern_size;
-        });
-        auto pos = it - rw_mmap.begin();
+            op = rw_mmap.begin() + history;
+        }
+        auto pos = op - rw_mmap.begin();
         rw_mmap.unmap();
         base += pos;
         fs::resize_file(filename, base);
+        sw.stop();
         std::cout << " done." << std::endl;
+        std::cout << "time: " << sw.elapsed_str() << std::endl;
+        std::cout << "speed: " << std::fixed << std::setprecision(2) << base / sw.elapsed() / 1024 / 1024 << " MB/s" << std::endl;
     }
- }
+ }
