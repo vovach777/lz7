@@ -58,6 +58,9 @@
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error "lz7: little-endian only (match_len uses ctz/clz on 64-bit loads)"
 #endif
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
 
 namespace lz7
 {
@@ -126,6 +129,43 @@ namespace lz7
             hashes[i] = hash_of(it + i);
     }
 
+    // ctz/clz для ненулевого x: builtin GCC/Clang, у MSVC — _BitScan*, на 32-битных целях по половинам.
+    inline int ctz64(uint64_t x)
+    {
+#if defined(_MSC_VER) && !defined(__clang__)
+        unsigned long i;
+#if defined(_M_X64) || defined(_M_ARM64)
+        _BitScanForward64(&i, x);
+        return int(i);
+#else
+        if (_BitScanForward(&i, static_cast<unsigned long>(x)))
+            return int(i);
+        _BitScanForward(&i, static_cast<unsigned long>(x >> 32));
+        return int(i) + 32;
+#endif
+#else
+        return __builtin_ctzll(x);
+#endif
+    }
+
+    inline int clz64(uint64_t x)
+    {
+#if defined(_MSC_VER) && !defined(__clang__)
+        unsigned long i;
+#if defined(_M_X64) || defined(_M_ARM64)
+        _BitScanReverse64(&i, x);
+        return 63 - int(i);
+#else
+        if (_BitScanReverse(&i, static_cast<unsigned long>(x >> 32)))
+            return 31 - int(i);
+        _BitScanReverse(&i, static_cast<unsigned long>(x));
+        return 63 - int(i);
+#endif
+#else
+        return __builtin_clzll(x);
+#endif
+    }
+
     // Длина совпадения a[0..] и b[0..]: xor 8-байтных слов, первая разница через ctz.
     inline int match_len(const uint8_t *a, const uint8_t *a_end, const uint8_t *b, const uint8_t *b_end)
     {
@@ -134,7 +174,7 @@ namespace lz7
         {
             const uint64_t x = load_u64(a) ^ load_u64(b);
             if (x)
-                return len + (__builtin_ctzll(x) >> 3);
+                return len + (ctz64(x) >> 3);
             len += 8;
             a += 8;
             b += 8;
@@ -157,7 +197,7 @@ namespace lz7
         {
             const uint64_t x = load_u64(a - 8) ^ load_u64(b - 8);
             if (x)
-                return len + (__builtin_clzll(x) >> 3);
+                return len + (clz64(x) >> 3);
             len += 8;
             a -= 8;
             b -= 8;

@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 add_definitions(-D_USE_MATH_DEFINES -DNOMINMAX -D_CRT_SECURE_NO_WARNINGS )
 # Интринсиков нет: по умолчанию бинарь переносимый. -march=native по замерам скорость не меняет.
 option(LZ7_NATIVE "Build with -march=native" OFF)
-if(LZ7_NATIVE)
+if(LZ7_NATIVE AND NOT MSVC)
   add_compile_options(-march=native)
 endif()
 
