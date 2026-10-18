@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
             //short literals
             if (literals_len) {
                 chk_expand(4);
-                reinterpret_cast<uint32_t*>(it)[0] = value;
+                std::memcpy(it, &value, sizeof(value));
                 it += literals_len;
             }
         },
@@ -229,7 +229,7 @@ int main(int argc, char** argv) {
         //pattern dup function
         [&](int pattern_size, uint32_t pattern,int count) {
             chk_expand(pattern_size * count);
-            reinterpret_cast<uint32_t*>(it)[0] = pattern;
+            std::memcpy(it, &pattern, sizeof(pattern));
             std::memmove(it + pattern_size, it, (count-1)*pattern_size);
             it += count*pattern_size;
         });
