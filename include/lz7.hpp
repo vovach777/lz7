@@ -44,7 +44,11 @@
 #include <tuple>
 #include <array>
 #include <optional>
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace lz7
 {
@@ -77,12 +81,20 @@ namespace lz7
         return value > above ? value + inc : set;
     }
 
+    // Невыровненная загрузка 32 бит без UB (компилируется в одну mov/ldr).
+    inline uint32_t load_u32(const uint8_t *p)
+    {
+        uint32_t v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    }
+
     inline uint32_t match_of(const uint8_t *it)
     {
 #if ENCODE_MIN == 3
-        return (reinterpret_cast<const uint32_t *>(it)[0] & 0xffffff);
+        return (load_u32(it) & 0xffffff);
 #else
-        return (reinterpret_cast<const uint32_t *>(it)[0]);
+        return load_u32(it);
 #endif
     }
 
@@ -91,36 +103,47 @@ namespace lz7
         return static_cast<uint16_t>(match_of(it) * 2654435761u >> (32 - HASH_LOG2));
     }
 
-    // SSE4.2 реализация hash_of для 4 последовательных 32-битных чисел
+    // Хэш для 4 соседних позиций: hashes[i] = hash_of(it + i).
+    // SSE4.1 / NEON / скалярный fallback; результат бит-в-бит одинаковый.
     inline void hash_of_sse42(const uint8_t *it, uint16_t *hashes)
     {
-        // Загрузить 4 последовательных 32-битных числа
+#if defined(__SSE4_1__)
         __m128i data = _mm_set_epi32(
-            reinterpret_cast<const uint32_t *>(it + 3)[0],
-            reinterpret_cast<const uint32_t *>(it + 2)[0],
-            reinterpret_cast<const uint32_t *>(it + 1)[0],
-            reinterpret_cast<const uint32_t *>(it + 0)[0]);
-
-        // Константа для хэширования (множитель)
+            (int)load_u32(it + 3),
+            (int)load_u32(it + 2),
+            (int)load_u32(it + 1),
+            (int)load_u32(it + 0));
         __m128i multiplier = _mm_set1_epi32(2654435761u);
-
-        // Умножить числа на константу (оставить младшие 32 бита)
         __m128i hash_values = _mm_mullo_epi32(data, multiplier);
-
-        // Сдвиг вправо для получения HASH_LOG2 бит
         __m128i shifted = _mm_srli_epi32(hash_values, 32 - HASH_LOG2);
-
-        // Преобразовать в 16-битные значения (младшие 16 бит результата)
         __m128i result = _mm_packus_epi32(shifted, shifted);
-
-        // Сохранить результат в массив hash
         _mm_storel_epi64(reinterpret_cast<__m128i *>(hashes), result);
+#elif defined(__ARM_NEON)
+        const uint32_t lanes[4] = {load_u32(it), load_u32(it + 1), load_u32(it + 2), load_u32(it + 3)};
+        uint32x4_t data = vld1q_u32(lanes);
+        uint32x4_t hash_values = vmulq_n_u32(data, 2654435761u);
+        uint32x4_t shifted = vshrq_n_u32(hash_values, 32 - HASH_LOG2);
+        vst1_u16(hashes, vmovn_u32(shifted));
+#else
+        for (int i = 0; i < 4; ++i)
+            hashes[i] = static_cast<uint16_t>(load_u32(it + i) * 2654435761u >> (32 - HASH_LOG2));
+#endif
     }
+
+    // Все 16 байт равны? (портабельно: без movemask)
+#if defined(__ARM_NEON)
+    inline bool neon_all_eq16(uint8x16_t eq)
+    {
+        uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u8(eq), 0);
+        uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u8(eq), 1);
+        return (lo & hi) == ~0ULL;
+    }
+#endif
 
     inline int match_len_simd(const uint8_t *a, const uint8_t *a_end, const uint8_t *b, const uint8_t *b_end)
     {
         int len = 0;
-#ifdef _USE_SIMD
+#if defined(_USE_SIMD) && defined(__SSE2__)
         while (a + 16 <= a_end && b + 16 <= b_end)
         {
             __m128i va = _mm_loadu_si128((__m128i *)a);
@@ -130,6 +153,20 @@ namespace lz7
             if (mask != 0xFFFF)
             {
                 return len + __builtin_ctz(~mask); // первая разница
+            }
+            len += 16;
+            a += 16;
+            b += 16;
+        }
+#elif defined(_USE_SIMD) && defined(__ARM_NEON)
+        while (a + 16 <= a_end && b + 16 <= b_end)
+        {
+            uint8x16_t eq = vceqq_u8(vld1q_u8(a), vld1q_u8(b));
+            if (!neon_all_eq16(eq))
+            {
+                // первая разница внутри этого блока: досканировать побайтово
+                while (a < a_end && b < b_end && *a == *b) { ++a; ++b; ++len; }
+                return len;
             }
             len += 16;
             a += 16;
@@ -149,7 +186,20 @@ namespace lz7
     inline int match_len_simd_backward(const uint8_t *a_begin, const uint8_t *a, const uint8_t *b_begin, const uint8_t *b)
     {
         int len = 0;
-#ifdef _USE_SIMD
+#if defined(_USE_SIMD) && defined(__ARM_NEON)
+        while (a - 15 >= a_begin && b - 15 >= b_begin)
+        {
+            uint8x16_t eq = vceqq_u8(vld1q_u8(a - 15), vld1q_u8(b - 15));
+            if (!neon_all_eq16(eq))
+            {
+                while (a >= a_begin && b >= b_begin && *a == *b) { --a; --b; ++len; }
+                return len;
+            }
+            len += 16;
+            a -= 16;
+            b -= 16;
+        }
+#elif defined(_USE_SIMD) && defined(__SSE2__)
         while (a - 15 >= a_begin && b - 15 >= b_begin)
         {
             __m128i va = _mm_loadu_si128((const __m128i *)(a - 15));
@@ -489,7 +539,7 @@ namespace lz7
             if (end - in >= 4)
             {
                 bytes_available = 4;
-                value32 = reinterpret_cast<const uint32_t *>(in)[0];
+                value32 = load_u32(in);
                 in += 4;
                 return;
             }
