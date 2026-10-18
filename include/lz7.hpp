@@ -3,7 +3,6 @@
 #define LZ7_H
 
 #define HAS_BUILTIN_CLZ
-#define _USE_SIMD
 #define MAX_OFFSET ((1 << 17) - 1)
 #define NO_MATCH_OFS (MAX_OFFSET)
 #define ENCODE_MIN (4)
@@ -55,10 +54,9 @@
 #include <tuple>
 #include <array>
 #include <optional>
-#if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#elif defined(__ARM_NEON)
-#include <arm_neon.h>
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "lz7: little-endian only (match_len uses ctz/clz on 64-bit loads)"
 #endif
 
 namespace lz7
@@ -114,77 +112,33 @@ namespace lz7
         return static_cast<uint16_t>(match_of(it) * 2654435761u >> (32 - HASH_LOG2));
     }
 
+    inline uint64_t load_u64(const uint8_t *p)
+    {
+        uint64_t v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    }
+
     // Хэш для 4 соседних позиций: hashes[i] = hash_of(it + i).
-    // SSE4.1 / NEON / скалярный fallback; результат бит-в-бит одинаковый.
-    inline void hash_of_sse42(const uint8_t *it, uint16_t *hashes)
+    inline void hash_of_x4(const uint8_t *it, uint16_t *hashes)
     {
-#if defined(__SSE4_1__)
-        __m128i data = _mm_set_epi32(
-            (int)load_u32(it + 3),
-            (int)load_u32(it + 2),
-            (int)load_u32(it + 1),
-            (int)load_u32(it + 0));
-        __m128i multiplier = _mm_set1_epi32(2654435761u);
-        __m128i hash_values = _mm_mullo_epi32(data, multiplier);
-        __m128i shifted = _mm_srli_epi32(hash_values, 32 - HASH_LOG2);
-        __m128i result = _mm_packus_epi32(shifted, shifted);
-        _mm_storel_epi64(reinterpret_cast<__m128i *>(hashes), result);
-#elif defined(__ARM_NEON)
-        const uint32_t lanes[4] = {load_u32(it), load_u32(it + 1), load_u32(it + 2), load_u32(it + 3)};
-        uint32x4_t data = vld1q_u32(lanes);
-        uint32x4_t hash_values = vmulq_n_u32(data, 2654435761u);
-        uint32x4_t shifted = vshrq_n_u32(hash_values, 32 - HASH_LOG2);
-        vst1_u16(hashes, vmovn_u32(shifted));
-#else
         for (int i = 0; i < 4; ++i)
-            hashes[i] = static_cast<uint16_t>(load_u32(it + i) * 2654435761u >> (32 - HASH_LOG2));
-#endif
+            hashes[i] = hash_of(it + i);
     }
 
-    // Все 16 байт равны? (портабельно: без movemask)
-#if defined(__ARM_NEON)
-    inline bool neon_all_eq16(uint8x16_t eq)
-    {
-        uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u8(eq), 0);
-        uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u8(eq), 1);
-        return (lo & hi) == ~0ULL;
-    }
-#endif
-
-    inline int match_len_simd(const uint8_t *a, const uint8_t *a_end, const uint8_t *b, const uint8_t *b_end)
+    // Длина совпадения a[0..] и b[0..]: xor 8-байтных слов, первая разница через ctz.
+    inline int match_len(const uint8_t *a, const uint8_t *a_end, const uint8_t *b, const uint8_t *b_end)
     {
         int len = 0;
-#if defined(_USE_SIMD) && defined(__SSE2__)
-        while (a + 16 <= a_end && b + 16 <= b_end)
+        while (a_end - a >= 8 && b_end - b >= 8)
         {
-            __m128i va = _mm_loadu_si128((__m128i *)a);
-            __m128i vb = _mm_loadu_si128((__m128i *)b);
-            __m128i cmp = _mm_cmpeq_epi8(va, vb);
-            int mask = _mm_movemask_epi8(cmp);
-            if (mask != 0xFFFF)
-            {
-                return len + __builtin_ctz(~mask); // первая разница
-            }
-            len += 16;
-            a += 16;
-            b += 16;
+            const uint64_t x = load_u64(a) ^ load_u64(b);
+            if (x)
+                return len + (__builtin_ctzll(x) >> 3);
+            len += 8;
+            a += 8;
+            b += 8;
         }
-#elif defined(_USE_SIMD) && defined(__ARM_NEON)
-        while (a + 16 <= a_end && b + 16 <= b_end)
-        {
-            uint8x16_t eq = vceqq_u8(vld1q_u8(a), vld1q_u8(b));
-            if (!neon_all_eq16(eq))
-            {
-                // первая разница внутри этого блока: досканировать побайтово
-                while (a < a_end && b < b_end && *a == *b) { ++a; ++b; ++len; }
-                return len;
-            }
-            len += 16;
-            a += 16;
-            b += 16;
-        }
-#endif
-        // добить хвост
         while (a < a_end && b < b_end && *a == *b)
         {
             ++a;
@@ -194,52 +148,26 @@ namespace lz7
         return len;
     }
 
-    inline int match_len_simd_backward(const uint8_t *a_begin, const uint8_t *a, const uint8_t *b_begin, const uint8_t *b)
+    // Число совпадающих байт перед a и b (a[-1] == b[-1], ...), не заходя за a_begin/b_begin.
+    // Старший байт 8-байтного слова — ближайший к a, поэтому clz.
+    inline int match_len_backward(const uint8_t *a_begin, const uint8_t *a, const uint8_t *b_begin, const uint8_t *b)
     {
         int len = 0;
-#if defined(_USE_SIMD) && defined(__ARM_NEON)
-        while (a - 15 >= a_begin && b - 15 >= b_begin)
+        while (a - a_begin >= 8 && b - b_begin >= 8)
         {
-            uint8x16_t eq = vceqq_u8(vld1q_u8(a - 15), vld1q_u8(b - 15));
-            if (!neon_all_eq16(eq))
-            {
-                while (a >= a_begin && b >= b_begin && *a == *b) { --a; --b; ++len; }
-                return len;
-            }
-            len += 16;
-            a -= 16;
-            b -= 16;
+            const uint64_t x = load_u64(a - 8) ^ load_u64(b - 8);
+            if (x)
+                return len + (__builtin_clzll(x) >> 3);
+            len += 8;
+            a -= 8;
+            b -= 8;
         }
-#elif defined(_USE_SIMD) && defined(__SSE2__)
-        while (a - 15 >= a_begin && b - 15 >= b_begin)
-        {
-            __m128i va = _mm_loadu_si128((const __m128i *)(a - 15));
-            __m128i vb = _mm_loadu_si128((const __m128i *)(b - 15));
-            __m128i cmp = _mm_cmpeq_epi8(va, vb);
-            int mask = _mm_movemask_epi8(cmp);
-
-            if (mask != 0xFFFF)
-            {
-                // Ищем первую единицу с конца mask (0 = несовпадение)
-                // Развернём маску для использования __builtin_clz
-                uint32_t inv_mask = (~mask) & 0xFFFF;
-                int leading_zeros = __builtin_clz(inv_mask) - 16; // mask в младших 16 битах
-                return len + leading_zeros;
-            }
-
-            len += 16;
-            a -= 16;
-            b -= 16;
-        }
-#endif
-
-        while (a >= a_begin && b >= b_begin && *a == *b)
+        while (a > a_begin && b > b_begin && a[-1] == b[-1])
         {
             --a;
             --b;
             ++len;
         }
-
         return len;
     }
 
@@ -355,14 +283,14 @@ namespace lz7
         auto hash_of_4(const uint8_t *idx)
         {
             alignas(16) uint16_t hashes[4];
-            hash_of_sse42(idx, hashes);
+            hash_of_x4(idx, hashes);
             return std::array{&hashtable[hashes[0]],&hashtable[hashes[1]], &hashtable[hashes[2]], &hashtable[hashes[3]]};
         }
 
         auto hash_of_4_with_filter(const uint8_t *idx)
         {
             alignas(16) uint16_t hashes[4];
-            hash_of_sse42(idx, hashes);
+            hash_of_x4(idx, hashes);
             return std::array{
                 &hashtable[hashes[0]],
                 hashes[1] == hashes[0] ? nullptr : &hashtable[hashes[1]],
@@ -501,7 +429,7 @@ namespace lz7
                     }
                 }
 
-                auto match_len = match_len_simd(ip, data_end, idx, data_end);
+                auto match_len = lz7::match_len(ip, data_end, idx, data_end);
                 if (match_len < ENCODE_MIN)
                 {
                     // кольцо chaintable переиспользуется: чужой хэш значит, что дальше цепочка протухла
@@ -513,7 +441,7 @@ namespace lz7
                 }
 
                 // idx не трогаем: следующий шаг по цепочке отсчитывается от него
-                int back_match_len = match_len_simd_backward(data_begin, idx - 1, emitp, ip - 1);
+                int back_match_len = match_len_backward(data_begin, idx, emitp, ip);
                 Best after{idx - back_match_len, ip - back_match_len, match_len + back_match_len};
                 assert(after.ip2 >= emitp);
                 assert(after.ofs >= data_begin);
