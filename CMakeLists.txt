@@ -5,9 +5,10 @@ project(LZ7Project)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 add_definitions(-D_USE_MATH_DEFINES -DNOMINMAX -D_CRT_SECURE_NO_WARNINGS )
-# x86-флаги только для x86: на ARM -mavx/-march=native не соберутся
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86|AMD64|amd64|i[3-6]86")
-  add_compile_options(-mavx -msse4.2 -mssse3 -march=native)
+# Интринсиков нет: по умолчанию бинарь переносимый. -march=native по замерам скорость не меняет.
+option(LZ7_NATIVE "Build with -march=native" OFF)
+if(LZ7_NATIVE)
+  add_compile_options(-march=native)
 endif()
 
 # Добавляем директории для заголовочных файлов
