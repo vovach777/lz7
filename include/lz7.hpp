@@ -759,6 +759,56 @@ namespace lz7
 
         for (;;)
         {
+            // Быстрый путь (как shortcut в LZ4): до концов входа и выхода не меньше 32 байт, литералов
+            // без расширения (не больше 6), длина матча без расширения или с одним байтом расширения,
+            // смещение >= 16. Литералы копируются фиксированными 16 байтами, матч — кусками по 16 байт
+            // без точной длины; лишние байты за реальным концом перезапишет следующий токен.
+            // Нулевое смещение (терминатор, токен литералов, паттерн) сюда не попадает.
+            if (in_end - in >= 32 && op_end - op >= 32)
+            {
+                const uint8_t t = in[0];
+                int64_t lits, len, ofs;
+                const uint8_t *next;
+                if (t & 0x80)
+                {
+                    lits = (t >> 3) & 0x3;
+                    len = t & 0x7;
+                    ofs = ((t << 3) & 0x300) | in[1 + lits];
+                    next = in + 2 + lits;
+                }
+                else
+                {
+                    lits = (t >> 3) & 0x7;
+                    len = t & 0x7;
+                    ofs = in[1 + lits] | (in[2 + lits] << 8) | ((t << 10) & 0x10000);
+                    next = in + 3 + lits;
+                }
+                bool len_ok = true; // расширение длины только из одного байта (< 255)
+                if (len == 7)
+                {
+                    len_ok = *next != 255;
+                    len += *next++;
+                }
+                len += ENCODE_MIN;
+                if (len_ok && lits != 7 && ofs >= 16 && ofs <= (op + lits) - window &&
+                    op_end - op >= lits + len + 16)
+                {
+                    std::memcpy(op, in + 1, 16);
+                    op += lits;
+                    const uint8_t *src = op - ofs;
+                    uint8_t *d = op;
+                    op += len;
+                    do
+                    {
+                        std::memcpy(d, src, 16);
+                        d += 16;
+                        src += 16;
+                    } while (d < op);
+                    in = next;
+                    continue;
+                }
+            }
+
             const uint8_t *tok = in;
             if (in >= in_end)
                 return {in, op, DecodeStatus::Done};
