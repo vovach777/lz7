@@ -712,6 +712,155 @@ namespace lz7
         }
     }
 
+
+    /* быстрый декодер в буфер */
+
+    // Запас за концом выходного буфера: wildcopy пишет кусками по 16 байт и может уйти за конец токена.
+    constexpr int DECODE_SLACK = 32;
+
+    enum class DecodeStatus
+    {
+        Done,       // вход кончился на границе токена
+        NeedOutput, // следующему токену нужно need байт выхода (включая DECODE_SLACK)
+        Error       // поток битый, причина в error
+    };
+
+    struct DecodeResult
+    {
+        const uint8_t *in;  // начало первого не декодированного токена
+        uint8_t *op;        // конец записанного
+        DecodeStatus status;
+        int64_t need{0};
+        const char *error{nullptr};
+    };
+
+    // Декодирует токены [in, in_end) в op. Пишет только ниже op_end; токен берётся, лишь если
+    // ему хватает места вместе с DECODE_SLACK, иначе возвращает NeedOutput на его начале.
+    // window — самый ранний байт, на который может ссылаться матч.
+    inline DecodeResult decode(const uint8_t *in, const uint8_t *in_end, uint8_t *op, uint8_t *op_end, const uint8_t *window)
+    {
+        auto fail = [&](const uint8_t *at, const char *why) { return DecodeResult{at, op, DecodeStatus::Error, 0, why}; };
+        // расширение длины: v += байты, пока байт == 255
+        auto read_ext = [&](const uint8_t *&p, int64_t &v) -> bool
+        {
+            for (;;)
+            {
+                if (p >= in_end)
+                    return false;
+                const uint8_t c = *p++;
+                v += c;
+                if (c != 255)
+                    return v < (int64_t(1) << 31);
+            }
+        };
+        auto copy_literals = [&](const uint8_t *src, int64_t n)
+        {
+            if (in_end - src >= n + 16)
+            {
+                uint8_t *d = op, *e = op + n;
+                do { std::memcpy(d, src, 16); d += 16; src += 16; } while (d < e);
+            }
+            else
+                std::memcpy(op, src, n);
+            op += n;
+        };
+        auto copy_match = [&](int64_t ofs, int64_t len)
+        {
+            const uint8_t *src = op - ofs;
+            uint8_t *d = op, *e = op + len;
+            if (ofs >= 16)
+                do { std::memcpy(d, src, 16); d += 16; src += 16; } while (d < e);
+            else if (ofs >= 8)
+                do { std::memcpy(d, src, 8); d += 8; src += 8; } while (d < e);
+            else
+                for (; d < e; ++d) *d = *(d - ofs);
+            op = e;
+        };
+
+        for (;;)
+        {
+            const uint8_t *tok = in;
+            if (in >= in_end)
+                return {in, op, DecodeStatus::Done};
+            {
+                // совместимость с expand: нулевые байты на границе токена = конец потока
+                uint32_t v = 0;
+                if (in_end - in >= 4)
+                    v = load_u32(in);
+                else
+                    std::memcpy(&v, in, in_end - in);
+                if (v == 0)
+                    return {in_end, op, DecodeStatus::Done};
+            }
+            const uint8_t t = *in++;
+            const uint8_t *lit;
+            int64_t lits, len, ofs;
+            if (t & 0x80)
+            {
+                // 1_xx_LL_MMM lit[LL] ofs_lo [ext]
+                lits = (t >> 3) & 0x3;
+                len = t & 0x7;
+                if (in_end - in < lits + 1)
+                    return fail(tok, "truncated token");
+                lit = in;
+                in += lits;
+                ofs = ((t << 3) & 0x300) | *in++;
+                if (len == 7 && !read_ext(in, len))
+                    return fail(tok, "truncated length");
+                if (ofs == 0)
+                {
+                    if (lits == 0)
+                    {
+                        // только литералы: их число в MMM
+                        lits = len;
+                        if (in_end - in < lits)
+                            return fail(tok, "truncated literals");
+                        if (op_end - op < lits + DECODE_SLACK)
+                            return {tok, op, DecodeStatus::NeedOutput, lits + DECODE_SLACK};
+                        copy_literals(in, lits);
+                        in += lits;
+                    }
+                    else
+                    {
+                        // паттерн из LL байт, повторённый MMM раз
+                        const int64_t n = lits * len;
+                        if (op_end - op < n + DECODE_SLACK)
+                            return {tok, op, DecodeStatus::NeedOutput, n + DECODE_SLACK};
+                        for (int64_t i = 0; i < n; ++i)
+                            op[i] = lit[i % lits];
+                        op += n;
+                    }
+                    continue;
+                }
+            }
+            else
+            {
+                // 0_x_LLL_MMM [ext] lit[n] ofs_lo ofs_hi [ext]
+                lits = (t >> 3) & 0x7;
+                len = t & 0x7;
+                if (lits == 7 && !read_ext(in, lits))
+                    return fail(tok, "truncated literal length");
+                if (in_end - in < lits + 2)
+                    return fail(tok, "truncated token");
+                lit = in;
+                in += lits;
+                ofs = in[0] | (in[1] << 8) | ((t << 10) & 0x10000);
+                in += 2;
+                if (len == 7 && !read_ext(in, len))
+                    return fail(tok, "truncated length");
+                if (ofs == 0)
+                    return fail(tok, "zero offset");
+            }
+            len += ENCODE_MIN;
+            if (op_end - op < lits + len + DECODE_SLACK)
+                return {tok, op, DecodeStatus::NeedOutput, lits + len + DECODE_SLACK};
+            if (ofs > (op + lits) - window)
+                return fail(tok, "offset before window");
+            copy_literals(lit, lits);
+            copy_match(ofs, len);
+        }
+    }
+
 }
 
 #endif // LZ7_H
