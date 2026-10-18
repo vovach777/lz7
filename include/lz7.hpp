@@ -6,14 +6,10 @@
 #define MAX_OFFSET ((1 << 17) - 1)
 #define NO_MATCH_OFS (MAX_OFFSET)
 #define ENCODE_MIN (4)
-// Глубина поиска по цепочке: жёсткий потолок и выход после MISS_STREAK кандидатов подряд
-// без улучшения. Дефолты подобраны по статистике Calgary/sqlite3.c/libstdc++:
-// лучший матч в 83-90% случаев находится за первые 8 кандидатов.
+// Жёсткий потолок кандидатов на один обход цепочки; обычно обход кончается раньше,
+// по серии промахов уровня сжатия (lz7::LEVELS).
 #ifndef MAX_ATTEMPTS
 #define MAX_ATTEMPTS (256)
-#endif
-#ifndef MISS_STREAK
-#define MISS_STREAK (8)
 #endif
 #define HASH_LOG2 (16)
 #define HASH_SIZE (1 << HASH_LOG2)
@@ -284,6 +280,20 @@ namespace lz7
         }
     };
 
+    // Уровень сжатия: сколько соседних позиций проверять за шаг (1..4) и после скольких
+    // кандидатов подряд без улучшения бросать обход цепочки. Подобрано замерами на
+    // Calgary/sqlite3.c/libstdc++/enwik8: 3 позиции выгоднее 4 на любом бюджете промахов,
+    // кроме максимального.
+    struct Level
+    {
+        int lookahead;
+        int miss_streak;
+    };
+    constexpr Level LEVELS[] = {{3, 4}, {3, 8}, {3, 16}, {4, 16}};
+    constexpr int MIN_LEVEL = 1;
+    constexpr int MAX_LEVEL = 4;
+    constexpr int DEFAULT_LEVEL = 2;
+
     class TokenSearcher
     {
         struct HashItem
@@ -306,6 +316,7 @@ namespace lz7
         const uint8_t *idxp;
         const uint8_t *emitp;
         Put_function put;
+        Level level;
 
         inline bool no_collision(const uint8_t *idx) const
         {
@@ -375,7 +386,7 @@ namespace lz7
 
 
     public:
-        TokenSearcher(const uint8_t *begin, const uint8_t *end, Put_function put) : put(put), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtable(HASH_SIZE, HashItem{}), chaintable(CHAIN_SIZE, ChainItem{}) {}
+        TokenSearcher(const uint8_t *begin, const uint8_t *end, Put_function put, Level level) : put(put), level(level), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtable(HASH_SIZE, HashItem{}), chaintable(CHAIN_SIZE, ChainItem{}) {}
 
         void emit(const Best &best)
         {
@@ -413,8 +424,10 @@ namespace lz7
                 }
 
                 Best match{};
-                for (auto h : hash_of_4_with_filter(ip))
+                auto hs = hash_of_4_with_filter(ip);
+                for (int k = 0; k < level.lookahead; ++k)
                 {
+                    auto h = hs[k];
                     if ((h != nullptr) && (h->idx != nullptr))
                         search_best(*h, match);
                     ip += 1;
@@ -463,7 +476,7 @@ namespace lz7
                     auto k = best.ip2 + best.len - ip;
                     if (k > 0 && ip + k < data_end && idx[k] != ip[k])
                     {
-                        if (++misses >= MISS_STREAK)
+                        if (++misses >= level.miss_streak)
                             break;
                         continue;
                     }
@@ -475,7 +488,7 @@ namespace lz7
                     // кольцо chaintable переиспользуется: чужой хэш значит, что дальше цепочка протухла
                     if (hash_of(idx) != hash_of(ip))
                         break;
-                    if (++misses >= MISS_STREAK)
+                    if (++misses >= level.miss_streak)
                         break;
                     continue;
                 }
@@ -492,17 +505,16 @@ namespace lz7
                     best = after;
                     misses = 0;
                 }
-                else if (++misses >= MISS_STREAK)
+                else if (++misses >= level.miss_streak)
                     break;
             }
         }
     };
 
-    inline void compress(const uint8_t *begin, const uint8_t *end, Put_function put)
+    inline void compress(const uint8_t *begin, const uint8_t *end, Put_function put, int level = DEFAULT_LEVEL)
     {
-        auto current = begin;
-        int plain_len = 0;
-        auto ts = TokenSearcher(begin, end, put);
+        level = std::clamp(level, MIN_LEVEL, MAX_LEVEL);
+        auto ts = TokenSearcher(begin, end, put, LEVELS[level - 1]);
         ts.compress();
     }
 

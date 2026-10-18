@@ -28,7 +28,7 @@ using myargs::args;
 int main(int argc, char** argv) {
     args.parse(argc, argv);
     if (args.size() < 2) {
-         std::cerr << "Usage: " << args[0] << " <filename>" << std::endl;
+         std::cerr << "Usage: " << args[0] << " [-d] [-b] [-l1..4] <input> [output]" << std::endl;
          return 1;
     }
     auto is_decoder = args.has('d') || args.has("decode");
@@ -46,6 +46,8 @@ int main(int argc, char** argv) {
 
     profiling::StopWatch sw;
     auto is_benchmark = args.has('b') || args.has("benchmark");
+    const int level = args.has("level") ? args.get<int>("level", lz7::DEFAULT_LEVEL, lz7::MIN_LEVEL, lz7::MAX_LEVEL)
+                                        : args.get<int>('l', lz7::DEFAULT_LEVEL, lz7::MIN_LEVEL, lz7::MAX_LEVEL);
     if (!is_decoder) {
         std::vector<uint8_t> out;
         out.reserve(mmap.size() / 2);
@@ -128,17 +130,18 @@ int main(int argc, char** argv) {
             sw.stop();
             std::cout << " " << sw.elapsed_str() <<    std::endl;
             sw.startnew();
-            lz7::compress(data.data(), data.data()+data.size(), lz7_fmt_1);
+            lz7::compress(data.data(), data.data()+data.size(), lz7_fmt_1, level);
             sw.stop();
         } else {
             sw.startnew();
-            lz7::compress(mmap.data(), mmap.data()+mmap.size(), lz7_fmt_1);
+            lz7::compress(mmap.data(), mmap.data()+mmap.size(), lz7_fmt_1, level);
             sw.stop();
         }
 
 
 
         std::cout << mmap.size() << " -> " << out.size() << std::fixed << std::setprecision(2) << " (" << (out.size() * 100. / mmap.size()) << "%)" << std::endl;
+        std::cout << "level: " << level << std::endl;
         std::cout << "time: " << sw.elapsed_str() << std::endl;
         std::cout << "speed: " << std::fixed << std::setprecision(2) <<  mmap.size() / sw.elapsed() / 1024 / 1024 << " MB/s" << std::endl;
 
