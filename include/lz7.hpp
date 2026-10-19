@@ -13,9 +13,9 @@
 #endif
 #define HASH_LOG2 (16)
 #define HASH_SIZE (1 << HASH_LOG2)
-#define CHAIN_LOG2 (16)
+#define CHAIN_LOG2 (17)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
-#define CHAIN_BREAK (CHAIN_SIZE - 1)
+#define CHAIN_MASK (CHAIN_SIZE - 1)
 // #define LOOK_AHEAD (2)
 // #define RLE_INDEX_TRIGGER 10
 // #define RLE_INDEX_DISTANCE 0x1000
@@ -27,8 +27,8 @@
 // #define _USE_JUMP_OVER_MATCH 0
 // // #define _ENABLE_RLE
 // #define CHECK_IP_END (sizeof(uint32_t))
-#if CHAIN_LOG2 > 16
-#error "CHAIN_LOG2 > chain is uint16_t only"
+#if CHAIN_SIZE <= MAX_OFFSET
+#error "chain ring must cover the whole window"
 #endif
 #if HASH_LOG2 > 16
 #error "HASH_LOG2 > 16: hashes are uint16_t (and _mm_packus_epi32 saturates)"
@@ -296,20 +296,14 @@ namespace lz7
 
     class TokenSearcher
     {
-        struct HashItem
-        {
-            const uint8_t *idx{nullptr};
-            uint16_t next_item{CHAIN_BREAK};
-            // uint16_t offset_relative{0}; //is allways 0. idx = idx-0;
-        };
-        struct ChainItem
-        {
-            uint16_t next_item{CHAIN_BREAK};
-            uint16_t offset_relative{0xFFFF};
-        };
-        std::vector<HashItem> hashtable; // index to chain
-        std::vector<ChainItem> chaintable;
-        uint16_t next_override_item{0};
+        // Цепочки по позиции, как в LZ4HC: звено позиции pos лежит в chain[pos & CHAIN_MASK]
+        // и хранит расстояние до предыдущей позиции с тем же хэшем (0 = конец цепочки).
+        // Кольцо покрывает всё окно, поэтому звено позиции внутри окна не перезаписано.
+        // head[h] = (позиция + 1) mod 2^32 последней вставки с хэшем h, 0 = пусто; расстояния
+        // считаются по модулю 2^32, поэтому вход больше 4 ГБ допустим: кандидат из устаревшей
+        // головы всё равно проверяется сравнением байт.
+        std::vector<uint32_t> head;
+        std::vector<uint32_t> chain;
         const uint8_t *data_begin;
         const uint8_t *data_end;
         const uint8_t *ip;
@@ -318,75 +312,68 @@ namespace lz7
         Put_function put;
         Level level;
 
+        inline uint32_t pos_of(const uint8_t *p) const
+        {
+            return uint32_t(p - data_begin);
+        }
+
+        // кандидат из головы цепочки для позиции p или nullptr
+        inline const uint8_t *head_candidate(uint32_t hp, const uint8_t *p) const
+        {
+            if (hp == 0)
+                return nullptr;
+            const size_t dist = uint32_t(pos_of(p) - (hp - 1));
+            if (dist == 0 || dist > MAX_OFFSET || dist > size_t(p - data_begin))
+                return nullptr;
+            return p - dist;
+        }
+
+        inline size_t chain_delta(const uint8_t *p) const
+        {
+            return chain[size_t(p - data_begin) & CHAIN_MASK];
+        }
+
         inline bool no_collision(const uint8_t *idx) const
         {
-            idx = hashtable[hash_of(idx)].idx; // idx to hashed-idx =)
-            return idx == nullptr || (emitp - idx) > MAX_OFFSET;
+            const uint8_t *c = head_candidate(head[hash_of(idx)], idx);
+            return c == nullptr || (emitp - c) > MAX_OFFSET;
         }
 
         inline auto far_collision(const uint8_t *idx) const
         {
-            auto hash = hash_of(idx);
-            auto index = hashtable[hash].idx;
-            return (index == nullptr) ? MAX_OFFSET : (idx - index);
+            const uint8_t *c = head_candidate(head[hash_of(idx)], idx);
+            return c == nullptr ? MAX_OFFSET : (idx - c);
         }
 
-        auto hash_of_4(const uint8_t *idx)
+        // головы цепочек для 4 соседних позиций; повтор хэша среди них -> 0 (уже обойдён)
+        auto heads_of_4_with_filter(const uint8_t *idx) const
         {
-            alignas(16) uint16_t hashes[4];
-            hash_of_x4(idx, hashes);
-            return std::array{&hashtable[hashes[0]],&hashtable[hashes[1]], &hashtable[hashes[2]], &hashtable[hashes[3]]};
+            alignas(16) uint16_t h[4];
+            hash_of_x4(idx, h);
+            return std::array<uint32_t, 4>{
+                head[h[0]],
+                h[1] == h[0] ? 0u : head[h[1]],
+                h[2] == h[1] || h[2] == h[0] ? 0u : head[h[2]],
+                h[3] == h[2] || h[3] == h[1] || h[3] == h[0] ? 0u : head[h[3]]};
         }
 
-        auto hash_of_4_with_filter(const uint8_t *idx)
+        // вставить 4 позиции подряд
+        inline void register_chain_items(const uint8_t *idx)
         {
-            alignas(16) uint16_t hashes[4];
-            hash_of_x4(idx, hashes);
-            return std::array{
-                &hashtable[hashes[0]],
-                hashes[1] == hashes[0] ? nullptr : &hashtable[hashes[1]],
-                hashes[2] == hashes[1] || hashes[2] == hashes[0] ? nullptr :  &hashtable[hashes[2]],
-                hashes[3] == hashes[2] || hashes[3] == hashes[1] ||  hashes[3] == hashes[0] ? nullptr :  &hashtable[hashes[3]]
-            };
-
-        }
-
-
-        inline void register_chain_items( const uint8_t *idx)
-        {
-            for (auto h : hash_of_4(idx))
+            alignas(16) uint16_t h[4];
+            hash_of_x4(idx, h);
+            for (int k = 0; k < 4; ++k)
             {
-                // в хэш-таблице ссылка на следующий элемент в цепочке. там находится размется между текущем смещением и текущим.
-                auto &hash_item = *h;
-                if (hash_item.idx == nullptr)
-                {
-                    hash_item.idx = idx++;
-                    hash_item.next_item = CHAIN_BREAK;
-                    continue;
-                }
-                if (hash_item.idx + 8 >= idx)
-                {
-                    idx++;
-                    continue;
-                }
-                uint16_t id = next_override_item;
-                if (id + 1 == CHAIN_BREAK)
-                    next_override_item = 0; // round
-                else
-                    next_override_item = id + 1;
-
-                auto &chain_item = chaintable[id];
-                chain_item.next_item = hash_item.next_item;
-                chain_item.offset_relative = std::min<ptrdiff_t>(0xFFFF, idx - hash_item.idx);
-                hash_item.idx = idx++;
-                hash_item.next_item = id;
+                const uint8_t *const p = idx + k;
+                const uint8_t *const prev = head_candidate(head[h[k]], p);
+                const size_t d = prev ? size_t(p - prev) : 0;
+                chain[size_t(p - data_begin) & CHAIN_MASK] = uint32_t(d);
+                head[h[k]] = pos_of(p) + 1;
             }
         }
 
-
-
     public:
-        TokenSearcher(const uint8_t *begin, const uint8_t *end, Put_function put, Level level) : put(put), level(level), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtable(HASH_SIZE, HashItem{}), chaintable(CHAIN_SIZE, ChainItem{}) {}
+        TokenSearcher(const uint8_t *begin, const uint8_t *end, Put_function put, Level level) : put(put), level(level), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), head(HASH_SIZE, 0), chain(CHAIN_SIZE, 0) {}
 
         void emit(const Best &best)
         {
@@ -424,12 +411,11 @@ namespace lz7
                 }
 
                 Best match{};
-                auto hs = hash_of_4_with_filter(ip);
+                auto hs = heads_of_4_with_filter(ip);
                 for (int k = 0; k < level.lookahead; ++k)
                 {
-                    auto h = hs[k];
-                    if ((h != nullptr) && (h->idx != nullptr))
-                        search_best(*h, match);
+                    if (hs[k])
+                        search_best(hs[k], match);
                     ip += 1;
                 }
                 if (match) {
@@ -438,7 +424,7 @@ namespace lz7
             }
             while (ip + 4 <= data_end) {
                 Best match{};
-                search_best(hashtable[ hash_of(ip) ], match);
+                search_best(head[hash_of(ip)], match);
                 if (match)
                     emit(match);
                 else
@@ -448,64 +434,53 @@ namespace lz7
             emit();
         }
 
-        void search_best(const HashItem& hash_item, Best &best, int nbAttemptsMax = MAX_ATTEMPTS) const
+        // оценить одного кандидата; false = бросить обход
+        bool try_candidate(const uint8_t *idx, Best &best, int &misses) const
         {
-            const uint8_t *idx{hash_item.idx};
+            // быстрый отсев: кандидат не длиннее лучшего, если не совпал байт, на котором лучший кончается
+            if (best)
+            {
+                auto k = best.ip2 + best.len - ip;
+                if (k > 0 && ip + k < data_end && idx[k] != ip[k])
+                    return ++misses < level.miss_streak;
+            }
+            auto match_len = lz7::match_len(ip, data_end, idx, data_end);
+            if (match_len < ENCODE_MIN) // коллизия хэша
+                return ++misses < level.miss_streak;
+            int back_match_len = match_len_backward(data_begin, idx, emitp, ip);
+            Best after{idx - back_match_len, ip - back_match_len, match_len + back_match_len};
+            assert(after.ip2 >= emitp);
+            assert(after.ofs >= data_begin);
+            after.optimize(emitp);
+            if (after.gain > best.gain)
+            {
+                best = after;
+                misses = 0;
+                return true;
+            }
+            return ++misses < level.miss_streak;
+        }
+
+        void search_best(uint32_t hp, Best &best, int nbAttemptsMax = MAX_ATTEMPTS) const
+        {
+            const uint8_t *idx = head_candidate(hp, ip);
             if (idx == nullptr)
                 return;
-            int next_item = hash_item.next_item;
             int misses = 0;
             for (int nbAttempts = 0; nbAttempts < nbAttemptsMax; nbAttempts++)
             {
                 if (nbAttempts > 0)
                 {
-                    if (next_item == CHAIN_BREAK)
+                    const size_t d = chain_delta(idx);
+                    if (d == 0 || d > size_t(idx - data_begin))
                         break;
-                    auto &chain_item = chaintable[next_item];
-                    idx -= chain_item.offset_relative;
-                    if (idx < data_begin || (emitp - idx > MAX_OFFSET))
+                    idx -= d;
+                    if (emitp - idx > MAX_OFFSET)
                         break;
-                    next_item = chain_item.next_item;
                 }
                 if (idx >= ip)
                     continue;
-
-                // быстрый отсев: кандидат не длиннее лучшего, если не совпал байт, на котором лучший кончается
-                if (best)
-                {
-                    auto k = best.ip2 + best.len - ip;
-                    if (k > 0 && ip + k < data_end && idx[k] != ip[k])
-                    {
-                        if (++misses >= level.miss_streak)
-                            break;
-                        continue;
-                    }
-                }
-
-                auto match_len = lz7::match_len(ip, data_end, idx, data_end);
-                if (match_len < ENCODE_MIN)
-                {
-                    // кольцо chaintable переиспользуется: чужой хэш значит, что дальше цепочка протухла
-                    if (hash_of(idx) != hash_of(ip))
-                        break;
-                    if (++misses >= level.miss_streak)
-                        break;
-                    continue;
-                }
-
-                // idx не трогаем: следующий шаг по цепочке отсчитывается от него
-                int back_match_len = match_len_backward(data_begin, idx, emitp, ip);
-                Best after{idx - back_match_len, ip - back_match_len, match_len + back_match_len};
-                assert(after.ip2 >= emitp);
-                assert(after.ofs >= data_begin);
-                after.optimize(emitp);
-
-                if (after.gain > best.gain)
-                {
-                    best = after;
-                    misses = 0;
-                }
-                else if (++misses >= level.miss_streak)
+                if (!try_candidate(idx, best, misses))
                     break;
             }
         }
