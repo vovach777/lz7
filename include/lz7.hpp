@@ -759,53 +759,109 @@ namespace lz7
 
         for (;;)
         {
-            // Быстрый путь (как shortcut в LZ4): до концов входа и выхода не меньше 32 байт, литералов
-            // без расширения (не больше 6), длина матча без расширения или с одним байтом расширения,
-            // смещение >= 16. Литералы копируются фиксированными 16 байтами, матч — кусками по 16 байт
-            // без точной длины; лишние байты за реальным концом перезапишет следующий токен.
-            // Нулевое смещение (терминатор, токен литералов, паттерн) сюда не попадает.
-            if (in_end - in >= 32 && op_end - op >= 32)
+            // Быстрый цикл по образцу LZ4_decompress_generic: пока до конца входа больше 32 байт, а до
+            // конца выхода больше 64, токены разбираются прямо по указателю. Тип токена (короткий/длинный)
+            // непредсказуем, поэтому поля обоих вариантов считаются без ветвления и выбираются маской.
+            // Литералы до 6 копируются 16 байтами, матч до 10 при смещении >= 8 — двумя по 8, остальное
+            // кусками по 32 (по 8 при смещении 8..15, побайтово при < 8). Лишние байты за реальным концом
+            // перезапишет следующий токен. Нулевое смещение, смещение за окном, ошибки расширений и
+            // близость конца откатываются на начало токена и уходят в общий путь ниже.
             {
-                const uint8_t t = in[0];
-                int64_t lits, len, ofs;
-                const uint8_t *next;
-                if (t & 0x80)
+                const uint8_t *const in_fast = in_end - 32;
+                uint8_t *const op_fast = op_end - 64;
+                auto wildcopy32 = [](uint8_t *d, const uint8_t *src, uint8_t *e)
                 {
-                    lits = (t >> 3) & 0x3;
-                    len = t & 0x7;
-                    ofs = ((t << 3) & 0x300) | in[1 + lits];
-                    next = in + 2 + lits;
-                }
-                else
-                {
-                    lits = (t >> 3) & 0x7;
-                    len = t & 0x7;
-                    ofs = in[1 + lits] | (in[2 + lits] << 8) | ((t << 10) & 0x10000);
-                    next = in + 3 + lits;
-                }
-                bool len_ok = true; // расширение длины только из одного байта (< 255)
-                if (len == 7)
-                {
-                    len_ok = *next != 255;
-                    len += *next++;
-                }
-                len += ENCODE_MIN;
-                if (len_ok && lits != 7 && ofs >= 16 && ofs <= (op + lits) - window &&
-                    op_end - op >= lits + len + 16)
-                {
-                    std::memcpy(op, in + 1, 16);
-                    op += lits;
-                    const uint8_t *src = op - ofs;
-                    uint8_t *d = op;
-                    op += len;
                     do
                     {
                         std::memcpy(d, src, 16);
-                        d += 16;
-                        src += 16;
-                    } while (d < op);
-                    in = next;
-                    continue;
+                        std::memcpy(d + 16, src + 16, 16);
+                        d += 32;
+                        src += 32;
+                    } while (d < e);
+                };
+                // расширение длины в быстром цикле: указатель за расширением или nullptr, если вышло за limit
+                auto fast_ext = [](const uint8_t *p, const uint8_t *limit, size_t &v) -> const uint8_t *
+                {
+                    for (;;)
+                    {
+                        if (p >= limit)
+                            return nullptr;
+                        const uint8_t c = *p++;
+                        v += c;
+                        if (c != 255)
+                            return v < (size_t(1) << 31) ? p : nullptr;
+                    }
+                };
+                while (in < in_fast && op < op_fast)
+                {
+                    const uint8_t *const tok_start = in;
+                    uint8_t *const op_start = op;
+                    const size_t t = *in++;
+                    const size_t s = t >> 7; // 1 = короткий токен
+                    size_t lits = (t >> 3) & (7 >> s);
+                    if (lits == 7)
+                    {
+                        const uint8_t *const q = fast_ext(in, in_end - 3, lits);
+                        if (!q || op + lits > op_end - 32 || q + lits > in_end - 32)
+                        {
+                            in = tok_start;
+                            op = op_start;
+                            break;
+                        }
+                        in = q;
+                        wildcopy32(op, in, op + lits);
+                    }
+                    else
+                        std::memcpy(op, in, 16);
+                    in += lits;
+                    op += lits;
+                    const size_t w = in[0] | (size_t(in[1]) << 8);
+                    const size_t ofs_short = ((t << 3) & 0x300) | (w & 0xff);
+                    const size_t ofs_long = w | ((t << 10) & 0x10000);
+                    const size_t m = size_t(0) - s;
+                    const size_t ofs = (ofs_short & m) | (ofs_long & ~m);
+                    in += 2 - s;
+                    const uint8_t *src = op - ofs;
+                    size_t len = t & 0x7;
+                    if (ofs == 0 || ofs > size_t(op - window))
+                    {
+                        in = tok_start;
+                        op = op_start;
+                        break;
+                    }
+                    if (len == 7)
+                    {
+                        const uint8_t *const q = fast_ext(in, in_end, len);
+                        if (!q || op + len + ENCODE_MIN >= op_fast)
+                        {
+                            in = tok_start;
+                            op = op_start;
+                            break;
+                        }
+                        in = q;
+                        len += ENCODE_MIN;
+                    }
+                    else
+                    {
+                        len += ENCODE_MIN;
+                        if (ofs >= 8)
+                        {
+                            std::memcpy(op, src, 8);
+                            std::memcpy(op + 8, src + 8, 8);
+                            op += len;
+                            continue;
+                        }
+                    }
+                    uint8_t *const e = op + len;
+                    if (ofs >= 16)
+                        wildcopy32(op, src, e);
+                    else if (ofs >= 8)
+                        for (uint8_t *d = op; d < e; d += 8, src += 8)
+                            std::memcpy(d, src, 8);
+                    else
+                        for (uint8_t *d = op; d < e; ++d)
+                            *d = *(d - ofs);
+                    op = e;
                 }
             }
 
