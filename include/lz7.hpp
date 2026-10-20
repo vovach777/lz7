@@ -13,9 +13,9 @@
 #endif
 #define HASH_LOG2 (16)
 #define HASH_SIZE (1 << HASH_LOG2)
-#define CHAIN_LOG2 (16)
+#define CHAIN_LOG2 (17)
 #define CHAIN_SIZE (1 << CHAIN_LOG2)
-#define CHAIN_BREAK (CHAIN_SIZE - 1)
+#define CHAIN_MASK (CHAIN_SIZE - 1)
 // #define LOOK_AHEAD (2)
 // #define RLE_INDEX_TRIGGER 10
 // #define RLE_INDEX_DISTANCE 0x1000
@@ -27,8 +27,8 @@
 // #define _USE_JUMP_OVER_MATCH 0
 // // #define _ENABLE_RLE
 // #define CHECK_IP_END (sizeof(uint32_t))
-#if CHAIN_LOG2 > 16
-#error "CHAIN_LOG2 > chain is uint16_t only"
+#if CHAIN_SIZE <= MAX_OFFSET
+#error "chain ring must cover the whole window"
 #endif
 #if HASH_LOG2 > 16
 #error "HASH_LOG2 > 16: hashes are uint16_t (and _mm_packus_epi32 saturates)"
@@ -93,6 +93,13 @@ namespace lz7
     inline uint32_t load_u32(const uint8_t *p)
     {
         uint32_t v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    }
+
+    inline uint16_t load_u16(const uint8_t *p)
+    {
+        uint16_t v;
         std::memcpy(&v, p, sizeof(v));
         return v;
     }
@@ -284,32 +291,29 @@ namespace lz7
     // кандидатов подряд без улучшения бросать обход цепочки. Подобрано замерами на
     // Calgary/sqlite3.c/libstdc++/enwik8: 3 позиции выгоднее 4 на любом бюджете промахов,
     // кроме максимального.
+    // lazy_searches != 0: ленивый разбор по образцу LZ4HC (LZ4HC_compress_hashChain) с этим
+    // числом кандидатов на поиск; lookahead и miss_streak тогда не используются.
     struct Level
     {
         int lookahead;
         int miss_streak;
+        int lazy_searches = 0;
     };
-    constexpr Level LEVELS[] = {{3, 4}, {3, 8}, {3, 16}, {4, 16}};
+    constexpr Level LEVELS[] = {{3, 4}, {3, 8}, {3, 16}, {4, 16}, {0, 0, 64}};
     constexpr int MIN_LEVEL = 1;
-    constexpr int MAX_LEVEL = 4;
+    constexpr int MAX_LEVEL = 5;
     constexpr int DEFAULT_LEVEL = 2;
 
     class TokenSearcher
     {
-        struct HashItem
-        {
-            const uint8_t *idx{nullptr};
-            uint16_t next_item{CHAIN_BREAK};
-            // uint16_t offset_relative{0}; //is allways 0. idx = idx-0;
-        };
-        struct ChainItem
-        {
-            uint16_t next_item{CHAIN_BREAK};
-            uint16_t offset_relative{0xFFFF};
-        };
-        std::vector<HashItem> hashtable; // index to chain
-        std::vector<ChainItem> chaintable;
-        uint16_t next_override_item{0};
+        // Цепочки по позиции, как в LZ4HC: звено позиции pos лежит в chain[pos & CHAIN_MASK]
+        // и хранит расстояние до предыдущей позиции с тем же хэшем (0 = конец цепочки).
+        // Кольцо покрывает всё окно, поэтому звено позиции внутри окна не перезаписано.
+        // head[h] = (позиция + 1) mod 2^32 последней вставки с хэшем h, 0 = пусто; расстояния
+        // считаются по модулю 2^32, поэтому вход больше 4 ГБ допустим: кандидат из устаревшей
+        // головы всё равно проверяется сравнением байт.
+        std::vector<uint32_t> head;
+        std::vector<uint32_t> chain;
         const uint8_t *data_begin;
         const uint8_t *data_end;
         const uint8_t *ip;
@@ -318,75 +322,68 @@ namespace lz7
         Put_function put;
         Level level;
 
+        inline uint32_t pos_of(const uint8_t *p) const
+        {
+            return uint32_t(p - data_begin);
+        }
+
+        // кандидат из головы цепочки для позиции p или nullptr
+        inline const uint8_t *head_candidate(uint32_t hp, const uint8_t *p) const
+        {
+            if (hp == 0)
+                return nullptr;
+            const size_t dist = uint32_t(pos_of(p) - (hp - 1));
+            if (dist == 0 || dist > MAX_OFFSET || dist > size_t(p - data_begin))
+                return nullptr;
+            return p - dist;
+        }
+
+        inline size_t chain_delta(const uint8_t *p) const
+        {
+            return chain[size_t(p - data_begin) & CHAIN_MASK];
+        }
+
         inline bool no_collision(const uint8_t *idx) const
         {
-            idx = hashtable[hash_of(idx)].idx; // idx to hashed-idx =)
-            return idx == nullptr || (emitp - idx) > MAX_OFFSET;
+            const uint8_t *c = head_candidate(head[hash_of(idx)], idx);
+            return c == nullptr || (emitp - c) > MAX_OFFSET;
         }
 
         inline auto far_collision(const uint8_t *idx) const
         {
-            auto hash = hash_of(idx);
-            auto index = hashtable[hash].idx;
-            return (index == nullptr) ? MAX_OFFSET : (idx - index);
+            const uint8_t *c = head_candidate(head[hash_of(idx)], idx);
+            return c == nullptr ? MAX_OFFSET : (idx - c);
         }
 
-        auto hash_of_4(const uint8_t *idx)
+        // головы цепочек для 4 соседних позиций; повтор хэша среди них -> 0 (уже обойдён)
+        auto heads_of_4_with_filter(const uint8_t *idx) const
         {
-            alignas(16) uint16_t hashes[4];
-            hash_of_x4(idx, hashes);
-            return std::array{&hashtable[hashes[0]],&hashtable[hashes[1]], &hashtable[hashes[2]], &hashtable[hashes[3]]};
+            alignas(16) uint16_t h[4];
+            hash_of_x4(idx, h);
+            return std::array<uint32_t, 4>{
+                head[h[0]],
+                h[1] == h[0] ? 0u : head[h[1]],
+                h[2] == h[1] || h[2] == h[0] ? 0u : head[h[2]],
+                h[3] == h[2] || h[3] == h[1] || h[3] == h[0] ? 0u : head[h[3]]};
         }
 
-        auto hash_of_4_with_filter(const uint8_t *idx)
+        // вставить 4 позиции подряд
+        inline void register_chain_items(const uint8_t *idx)
         {
-            alignas(16) uint16_t hashes[4];
-            hash_of_x4(idx, hashes);
-            return std::array{
-                &hashtable[hashes[0]],
-                hashes[1] == hashes[0] ? nullptr : &hashtable[hashes[1]],
-                hashes[2] == hashes[1] || hashes[2] == hashes[0] ? nullptr :  &hashtable[hashes[2]],
-                hashes[3] == hashes[2] || hashes[3] == hashes[1] ||  hashes[3] == hashes[0] ? nullptr :  &hashtable[hashes[3]]
-            };
-
-        }
-
-
-        inline void register_chain_items( const uint8_t *idx)
-        {
-            for (auto h : hash_of_4(idx))
+            alignas(16) uint16_t h[4];
+            hash_of_x4(idx, h);
+            for (int k = 0; k < 4; ++k)
             {
-                // в хэш-таблице ссылка на следующий элемент в цепочке. там находится размется между текущем смещением и текущим.
-                auto &hash_item = *h;
-                if (hash_item.idx == nullptr)
-                {
-                    hash_item.idx = idx++;
-                    hash_item.next_item = CHAIN_BREAK;
-                    continue;
-                }
-                if (hash_item.idx + 8 >= idx)
-                {
-                    idx++;
-                    continue;
-                }
-                uint16_t id = next_override_item;
-                if (id + 1 == CHAIN_BREAK)
-                    next_override_item = 0; // round
-                else
-                    next_override_item = id + 1;
-
-                auto &chain_item = chaintable[id];
-                chain_item.next_item = hash_item.next_item;
-                chain_item.offset_relative = std::min<ptrdiff_t>(0xFFFF, idx - hash_item.idx);
-                hash_item.idx = idx++;
-                hash_item.next_item = id;
+                const uint8_t *const p = idx + k;
+                const uint8_t *const prev = head_candidate(head[h[k]], p);
+                const size_t d = prev ? size_t(p - prev) : 0;
+                chain[size_t(p - data_begin) & CHAIN_MASK] = uint32_t(d);
+                head[h[k]] = pos_of(p) + 1;
             }
         }
 
-
-
     public:
-        TokenSearcher(const uint8_t *begin, const uint8_t *end, Put_function put, Level level) : put(put), level(level), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), hashtable(HASH_SIZE, HashItem{}), chaintable(CHAIN_SIZE, ChainItem{}) {}
+        TokenSearcher(const uint8_t *begin, const uint8_t *end, Put_function put, Level level) : put(put), level(level), idxp(begin), ip(begin), emitp(begin), data_begin(begin), data_end(end), head(HASH_SIZE, 0), chain(CHAIN_SIZE, 0) {}
 
         void emit(const Best &best)
         {
@@ -424,12 +421,11 @@ namespace lz7
                 }
 
                 Best match{};
-                auto hs = hash_of_4_with_filter(ip);
+                auto hs = heads_of_4_with_filter(ip);
                 for (int k = 0; k < level.lookahead; ++k)
                 {
-                    auto h = hs[k];
-                    if ((h != nullptr) && (h->idx != nullptr))
-                        search_best(*h, match);
+                    if (hs[k])
+                        search_best(hs[k], match);
                     ip += 1;
                 }
                 if (match) {
@@ -438,7 +434,7 @@ namespace lz7
             }
             while (ip + 4 <= data_end) {
                 Best match{};
-                search_best(hashtable[ hash_of(ip) ], match);
+                search_best(head[hash_of(ip)], match);
                 if (match)
                     emit(match);
                 else
@@ -448,74 +444,291 @@ namespace lz7
             emit();
         }
 
-        void search_best(const HashItem& hash_item, Best &best, int nbAttemptsMax = MAX_ATTEMPTS) const
+        // оценить одного кандидата; false = бросить обход
+        bool try_candidate(const uint8_t *idx, Best &best, int &misses) const
         {
-            const uint8_t *idx{hash_item.idx};
+            // быстрый отсев: кандидат не длиннее лучшего, если не совпал байт, на котором лучший кончается
+            if (best)
+            {
+                auto k = best.ip2 + best.len - ip;
+                if (k > 0 && ip + k < data_end && idx[k] != ip[k])
+                    return ++misses < level.miss_streak;
+            }
+            auto match_len = lz7::match_len(ip, data_end, idx, data_end);
+            if (match_len < ENCODE_MIN) // коллизия хэша
+                return ++misses < level.miss_streak;
+            int back_match_len = match_len_backward(data_begin, idx, emitp, ip);
+            Best after{idx - back_match_len, ip - back_match_len, match_len + back_match_len};
+            assert(after.ip2 >= emitp);
+            assert(after.ofs >= data_begin);
+            after.optimize(emitp);
+            if (after.gain > best.gain)
+            {
+                best = after;
+                misses = 0;
+                return true;
+            }
+            return ++misses < level.miss_streak;
+        }
+
+        void search_best(uint32_t hp, Best &best, int nbAttemptsMax = MAX_ATTEMPTS) const
+        {
+            const uint8_t *idx = head_candidate(hp, ip);
             if (idx == nullptr)
                 return;
-            int next_item = hash_item.next_item;
             int misses = 0;
             for (int nbAttempts = 0; nbAttempts < nbAttemptsMax; nbAttempts++)
             {
                 if (nbAttempts > 0)
                 {
-                    if (next_item == CHAIN_BREAK)
+                    const size_t d = chain_delta(idx);
+                    if (d == 0 || d > size_t(idx - data_begin))
                         break;
-                    auto &chain_item = chaintable[next_item];
-                    idx -= chain_item.offset_relative;
-                    if (idx < data_begin || (emitp - idx > MAX_OFFSET))
+                    idx -= d;
+                    if (emitp - idx > MAX_OFFSET)
                         break;
-                    next_item = chain_item.next_item;
                 }
                 if (idx >= ip)
                     continue;
-
-                // быстрый отсев: кандидат не длиннее лучшего, если не совпал байт, на котором лучший кончается
-                if (best)
-                {
-                    auto k = best.ip2 + best.len - ip;
-                    if (k > 0 && ip + k < data_end && idx[k] != ip[k])
-                    {
-                        if (++misses >= level.miss_streak)
-                            break;
-                        continue;
-                    }
-                }
-
-                auto match_len = lz7::match_len(ip, data_end, idx, data_end);
-                if (match_len < ENCODE_MIN)
-                {
-                    // кольцо chaintable переиспользуется: чужой хэш значит, что дальше цепочка протухла
-                    if (hash_of(idx) != hash_of(ip))
-                        break;
-                    if (++misses >= level.miss_streak)
-                        break;
-                    continue;
-                }
-
-                // idx не трогаем: следующий шаг по цепочке отсчитывается от него
-                int back_match_len = match_len_backward(data_begin, idx, emitp, ip);
-                Best after{idx - back_match_len, ip - back_match_len, match_len + back_match_len};
-                assert(after.ip2 >= emitp);
-                assert(after.ofs >= data_begin);
-                after.optimize(emitp);
-
-                if (after.gain > best.gain)
-                {
-                    best = after;
-                    misses = 0;
-                }
-                else if (++misses >= level.miss_streak)
+                if (!try_candidate(idx, best, misses))
                     break;
             }
+        }
+
+        // ---- ленивый разбор по образцу LZ4HC_compress_hashChain ----
+        struct LazyMatch
+        {
+            int len;     // 0 = нет матча
+            size_t off;  // смещение
+            int score;   // выгода: len минус заголовок токена
+        };
+
+        // байты заголовка токена lz7, которые зависят от выбора матча: токен, смещение и
+        // расширение длины матча. Расширение длины литералов не считается: серию литералов
+        // всё равно закроет какой-то токен.
+        static constexpr int token_cost(size_t lits, int len, size_t off)
+        {
+            const int me = len - ENCODE_MIN >= 7 ? (len - ENCODE_MIN - 7) / 255 + 1 : 0;
+            return (off < 1024 && lits < 4 ? 2 : 3) + me;
+        }
+
+        inline void register_one(const uint8_t *p)
+        {
+            const uint16_t h = hash_of(p);
+            const uint8_t *const prev = head_candidate(head[h], p);
+            chain[size_t(p - data_begin) & CHAIN_MASK] = prev ? uint32_t(p - prev) : 0;
+            head[h] = pos_of(p) + 1;
+        }
+
+        inline void insert_upto(const uint8_t *p)
+        {
+            for (; idxp < p; ++idxp)
+                register_one(idxp);
+        }
+
+        // Матч для позиции p, который может начинаться раньше p, но не раньше low
+        // (LZ4HC_InsertAndGetWiderMatch). Как в HC, годится только матч длиннее min_len, а из
+        // годных берётся самый выгодный по цене формата; литералы перед ним считаются от prev_end.
+        LazyMatch find_wider(const uint8_t *p, const uint8_t *low, const uint8_t *prev_end, int min_score, int min_len,
+                             const uint8_t *&start, int attempts)
+        {
+            LazyMatch m{0, 0, 0};
+            int longest = std::max(ENCODE_MIN - 1, min_len); // порог для быстрого отсева
+            start = p;
+            insert_upto(p);
+            const uint8_t *cand = head_candidate(head[hash_of(p)], p);
+            const uint32_t pattern = load_u32(p);
+            const ptrdiff_t look_back = p - low;
+            while (cand != nullptr && attempts-- > 0)
+            {
+                // быстрый отсев по двум байтам там, где кончается текущий лучший
+                const uint8_t *const qa = low + longest - 1;
+                const uint8_t *const qb = cand - look_back + longest - 1;
+                const bool quick = qb < data_begin || qa + 2 > data_end || load_u16(qa) == load_u16(qb);
+                if (quick && load_u32(cand) == pattern)
+                {
+                    int back = 0;
+                    while (p - back > low && cand - back > data_begin && p[-back - 1] == cand[-back - 1])
+                        ++back;
+                    const int len = ENCODE_MIN + lz7::match_len(p + ENCODE_MIN, data_end, cand + ENCODE_MIN, data_end) + back;
+                    const size_t off = size_t(p - cand);
+                    const uint8_t *const st = p - back;
+                    const size_t lits = st > prev_end ? size_t(st - prev_end) : 0;
+                    const int score = len - token_cost(lits, len, off);
+                    if (len > min_len && score > min_score)
+                    {
+                        min_score = score;
+                        longest = std::max(longest, len - 2);
+                        m = {len, off, score};
+                        start = st;
+                    }
+                }
+                const size_t d = chain_delta(cand);
+                if (d == 0 || d > size_t(cand - data_begin))
+                    break;
+                cand -= d;
+                if (size_t(p - cand) > MAX_OFFSET)
+                    break;
+            }
+            return m;
+        }
+
+        void compress_lazy(int nb)
+        {
+            // OPTIMAL_ML: длина, до которой матч кодируется без байта расширения (поле MMM = 0..6)
+            constexpr int OPTIMAL_ML = 6 + ENCODE_MIN;
+            constexpr int MFLIMIT = 12;
+            const uint8_t *anchor = data_begin;
+            auto encode = [&](const uint8_t *&q, const LazyMatch &m)
+            {
+                if (m.len < ENCODE_MIN) // обрезан до негодного: остаётся литералами
+                {
+                    q += m.len;
+                    return;
+                }
+                assert(m.off > 0 && m.off <= MAX_OFFSET);
+                put(int(m.off), m.len, anchor, int(q - anchor));
+                q += m.len;
+                anchor = q;
+            };
+            if (data_end - data_begin > MFLIMIT)
+            {
+                const uint8_t *const mflimit = data_end - MFLIMIT;
+                const uint8_t *ip = data_begin;
+                const uint8_t *start0, *start2 = nullptr, *start3 = nullptr;
+                LazyMatch m0, m1, m2, m3;
+                const LazyMatch none{0, 0, 0};
+                while (ip <= mflimit)
+                {
+                    const uint8_t *s1;
+                    m1 = find_wider(ip, ip, anchor, 0, ENCODE_MIN - 1, s1, nb);
+                    if (m1.len < ENCODE_MIN)
+                    {
+                        ++ip;
+                        continue;
+                    }
+                    start0 = ip;
+                    m0 = m1;
+                search2:
+                    if (ip + m1.len <= mflimit)
+                        m2 = find_wider(ip + m1.len - 2, ip, ip + m1.len, 0, m1.len, start2, nb);
+                    else
+                        m2 = none;
+                    if (m2.len <= m1.len) // лучше нет: пишем m1
+                    {
+                        encode(ip, m1);
+                        continue;
+                    }
+                    if (start0 < ip && start2 < ip + m0.len) // m1 пропускали: вернуть исходный
+                    {
+                        ip = start0;
+                        m1 = m0;
+                    }
+                    if (start2 - ip < 3) // первый слишком короткий: выбросить
+                    {
+                        ip = start2;
+                        m1 = m2;
+                        goto search2;
+                    }
+                search3:
+                    if (start2 - ip < OPTIMAL_ML)
+                    {
+                        int new_ml = std::min(m1.len, OPTIMAL_ML);
+                        if (ip + new_ml > start2 + m2.len - ENCODE_MIN)
+                            new_ml = int(start2 - ip) + m2.len - ENCODE_MIN;
+                        const int correction = new_ml - int(start2 - ip);
+                        if (correction > 0)
+                        {
+                            start2 += correction;
+                            m2.len -= correction;
+                        }
+                    }
+                    if (start2 + m2.len <= mflimit)
+                        m3 = find_wider(start2 + m2.len - 3, start2, start2 + m2.len, 0, m2.len, start3, nb);
+                    else
+                        m3 = none;
+                    if (m3.len <= m2.len) // третьего нет: пишем m1 и m2
+                    {
+                        if (start2 < ip + m1.len)
+                            m1.len = int(start2 - ip);
+                        encode(ip, m1);
+                        ip = start2;
+                        encode(ip, m2);
+                        continue;
+                    }
+                    if (start3 < ip + m1.len + 3) // m2 не помещается: убрать его
+                    {
+                        if (start3 >= ip + m1.len) // m1 можно писать сразу, m3 становится m1
+                        {
+                            if (start2 < ip + m1.len)
+                            {
+                                const int correction = int(ip + m1.len - start2);
+                                start2 += correction;
+                                m2.len -= correction;
+                                if (m2.len < ENCODE_MIN)
+                                {
+                                    start2 = start3;
+                                    m2 = m3;
+                                }
+                            }
+                            encode(ip, m1);
+                            ip = start3;
+                            m1 = m3;
+                            start0 = start2;
+                            m0 = m2;
+                            goto search2;
+                        }
+                        start2 = start3;
+                        m2 = m3;
+                        goto search3;
+                    }
+                    // три матча по возрастанию: пишем m1, обрезав его о начало m2
+                    if (start2 < ip + m1.len)
+                    {
+                        if (start2 - ip < OPTIMAL_ML)
+                        {
+                            if (m1.len > OPTIMAL_ML)
+                                m1.len = OPTIMAL_ML;
+                            if (ip + m1.len > start2 + m2.len - ENCODE_MIN)
+                                m1.len = int(start2 - ip) + m2.len - ENCODE_MIN;
+                            const int correction = m1.len - int(start2 - ip);
+                            if (correction > 0)
+                            {
+                                start2 += correction;
+                                m2.len -= correction;
+                            }
+                        }
+                        else
+                            m1.len = int(start2 - ip);
+                    }
+                    encode(ip, m1);
+                    ip = start2;
+                    m1 = m2;
+                    start2 = start3;
+                    m2 = m3;
+                    goto search3;
+                }
+            }
+            if (anchor < data_end)
+                put(0, 0, anchor, int(data_end - anchor));
+        }
+
+    public:
+        void compress_dispatch()
+        {
+            if (level.lazy_searches)
+                compress_lazy(level.lazy_searches);
+            else
+                compress();
         }
     };
 
     inline void compress(const uint8_t *begin, const uint8_t *end, Put_function put, int level = DEFAULT_LEVEL)
     {
         level = std::clamp(level, MIN_LEVEL, MAX_LEVEL);
-        auto ts = TokenSearcher(begin, end, put, LEVELS[level - 1]);
-        ts.compress();
+        auto lv = LEVELS[level - 1];
+        auto ts = TokenSearcher(begin, end, put, lv);
+        ts.compress_dispatch();
     }
 
     /* expand operators */
