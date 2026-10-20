@@ -97,6 +97,13 @@ namespace lz7
         return v;
     }
 
+    inline uint16_t load_u16(const uint8_t *p)
+    {
+        uint16_t v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    }
+
     inline uint32_t match_of(const uint8_t *it)
     {
 #if ENCODE_MIN == 3
@@ -284,14 +291,17 @@ namespace lz7
     // кандидатов подряд без улучшения бросать обход цепочки. Подобрано замерами на
     // Calgary/sqlite3.c/libstdc++/enwik8: 3 позиции выгоднее 4 на любом бюджете промахов,
     // кроме максимального.
+    // lazy_searches != 0: ленивый разбор по образцу LZ4HC (LZ4HC_compress_hashChain) с этим
+    // числом кандидатов на поиск; lookahead и miss_streak тогда не используются.
     struct Level
     {
         int lookahead;
         int miss_streak;
+        int lazy_searches = 0;
     };
-    constexpr Level LEVELS[] = {{3, 4}, {3, 8}, {3, 16}, {4, 16}};
+    constexpr Level LEVELS[] = {{3, 4}, {3, 8}, {3, 16}, {4, 16}, {0, 0, 64}};
     constexpr int MIN_LEVEL = 1;
-    constexpr int MAX_LEVEL = 4;
+    constexpr int MAX_LEVEL = 5;
     constexpr int DEFAULT_LEVEL = 2;
 
     class TokenSearcher
@@ -484,13 +494,241 @@ namespace lz7
                     break;
             }
         }
+
+        // ---- ленивый разбор по образцу LZ4HC_compress_hashChain ----
+        struct LazyMatch
+        {
+            int len;     // 0 = нет матча
+            size_t off;  // смещение
+            int score;   // выгода: len минус заголовок токена
+        };
+
+        // байты заголовка токена lz7, которые зависят от выбора матча: токен, смещение и
+        // расширение длины матча. Расширение длины литералов не считается: серию литералов
+        // всё равно закроет какой-то токен.
+        static constexpr int token_cost(size_t lits, int len, size_t off)
+        {
+            const int me = len - ENCODE_MIN >= 7 ? (len - ENCODE_MIN - 7) / 255 + 1 : 0;
+            return (off < 1024 && lits < 4 ? 2 : 3) + me;
+        }
+
+        inline void register_one(const uint8_t *p)
+        {
+            const uint16_t h = hash_of(p);
+            const uint8_t *const prev = head_candidate(head[h], p);
+            chain[size_t(p - data_begin) & CHAIN_MASK] = prev ? uint32_t(p - prev) : 0;
+            head[h] = pos_of(p) + 1;
+        }
+
+        inline void insert_upto(const uint8_t *p)
+        {
+            for (; idxp < p; ++idxp)
+                register_one(idxp);
+        }
+
+        // Матч для позиции p, который может начинаться раньше p, но не раньше low
+        // (LZ4HC_InsertAndGetWiderMatch). Как в HC, годится только матч длиннее min_len, а из
+        // годных берётся самый выгодный по цене формата; литералы перед ним считаются от prev_end.
+        LazyMatch find_wider(const uint8_t *p, const uint8_t *low, const uint8_t *prev_end, int min_score, int min_len,
+                             const uint8_t *&start, int attempts)
+        {
+            LazyMatch m{0, 0, 0};
+            int longest = std::max(ENCODE_MIN - 1, min_len); // порог для быстрого отсева
+            start = p;
+            insert_upto(p);
+            const uint8_t *cand = head_candidate(head[hash_of(p)], p);
+            const uint32_t pattern = load_u32(p);
+            const ptrdiff_t look_back = p - low;
+            while (cand != nullptr && attempts-- > 0)
+            {
+                // быстрый отсев по двум байтам там, где кончается текущий лучший
+                const uint8_t *const qa = low + longest - 1;
+                const uint8_t *const qb = cand - look_back + longest - 1;
+                const bool quick = qb < data_begin || qa + 2 > data_end || load_u16(qa) == load_u16(qb);
+                if (quick && load_u32(cand) == pattern)
+                {
+                    int back = 0;
+                    while (p - back > low && cand - back > data_begin && p[-back - 1] == cand[-back - 1])
+                        ++back;
+                    const int len = ENCODE_MIN + lz7::match_len(p + ENCODE_MIN, data_end, cand + ENCODE_MIN, data_end) + back;
+                    const size_t off = size_t(p - cand);
+                    const uint8_t *const st = p - back;
+                    const size_t lits = st > prev_end ? size_t(st - prev_end) : 0;
+                    const int score = len - token_cost(lits, len, off);
+                    if (len > min_len && score > min_score)
+                    {
+                        min_score = score;
+                        longest = std::max(longest, len - 2);
+                        m = {len, off, score};
+                        start = st;
+                    }
+                }
+                const size_t d = chain_delta(cand);
+                if (d == 0 || d > size_t(cand - data_begin))
+                    break;
+                cand -= d;
+                if (size_t(p - cand) > MAX_OFFSET)
+                    break;
+            }
+            return m;
+        }
+
+        void compress_lazy(int nb)
+        {
+            // OPTIMAL_ML: длина, до которой матч кодируется без байта расширения (поле MMM = 0..6)
+            constexpr int OPTIMAL_ML = 6 + ENCODE_MIN;
+            constexpr int MFLIMIT = 12;
+            const uint8_t *anchor = data_begin;
+            auto encode = [&](const uint8_t *&q, const LazyMatch &m)
+            {
+                if (m.len < ENCODE_MIN) // обрезан до негодного: остаётся литералами
+                {
+                    q += m.len;
+                    return;
+                }
+                assert(m.off > 0 && m.off <= MAX_OFFSET);
+                put(int(m.off), m.len, anchor, int(q - anchor));
+                q += m.len;
+                anchor = q;
+            };
+            if (data_end - data_begin > MFLIMIT)
+            {
+                const uint8_t *const mflimit = data_end - MFLIMIT;
+                const uint8_t *ip = data_begin;
+                const uint8_t *start0, *start2 = nullptr, *start3 = nullptr;
+                LazyMatch m0, m1, m2, m3;
+                const LazyMatch none{0, 0, 0};
+                while (ip <= mflimit)
+                {
+                    const uint8_t *s1;
+                    m1 = find_wider(ip, ip, anchor, 0, ENCODE_MIN - 1, s1, nb);
+                    if (m1.len < ENCODE_MIN)
+                    {
+                        ++ip;
+                        continue;
+                    }
+                    start0 = ip;
+                    m0 = m1;
+                search2:
+                    if (ip + m1.len <= mflimit)
+                        m2 = find_wider(ip + m1.len - 2, ip, ip + m1.len, 0, m1.len, start2, nb);
+                    else
+                        m2 = none;
+                    if (m2.len <= m1.len) // лучше нет: пишем m1
+                    {
+                        encode(ip, m1);
+                        continue;
+                    }
+                    if (start0 < ip && start2 < ip + m0.len) // m1 пропускали: вернуть исходный
+                    {
+                        ip = start0;
+                        m1 = m0;
+                    }
+                    if (start2 - ip < 3) // первый слишком короткий: выбросить
+                    {
+                        ip = start2;
+                        m1 = m2;
+                        goto search2;
+                    }
+                search3:
+                    if (start2 - ip < OPTIMAL_ML)
+                    {
+                        int new_ml = std::min(m1.len, OPTIMAL_ML);
+                        if (ip + new_ml > start2 + m2.len - ENCODE_MIN)
+                            new_ml = int(start2 - ip) + m2.len - ENCODE_MIN;
+                        const int correction = new_ml - int(start2 - ip);
+                        if (correction > 0)
+                        {
+                            start2 += correction;
+                            m2.len -= correction;
+                        }
+                    }
+                    if (start2 + m2.len <= mflimit)
+                        m3 = find_wider(start2 + m2.len - 3, start2, start2 + m2.len, 0, m2.len, start3, nb);
+                    else
+                        m3 = none;
+                    if (m3.len <= m2.len) // третьего нет: пишем m1 и m2
+                    {
+                        if (start2 < ip + m1.len)
+                            m1.len = int(start2 - ip);
+                        encode(ip, m1);
+                        ip = start2;
+                        encode(ip, m2);
+                        continue;
+                    }
+                    if (start3 < ip + m1.len + 3) // m2 не помещается: убрать его
+                    {
+                        if (start3 >= ip + m1.len) // m1 можно писать сразу, m3 становится m1
+                        {
+                            if (start2 < ip + m1.len)
+                            {
+                                const int correction = int(ip + m1.len - start2);
+                                start2 += correction;
+                                m2.len -= correction;
+                                if (m2.len < ENCODE_MIN)
+                                {
+                                    start2 = start3;
+                                    m2 = m3;
+                                }
+                            }
+                            encode(ip, m1);
+                            ip = start3;
+                            m1 = m3;
+                            start0 = start2;
+                            m0 = m2;
+                            goto search2;
+                        }
+                        start2 = start3;
+                        m2 = m3;
+                        goto search3;
+                    }
+                    // три матча по возрастанию: пишем m1, обрезав его о начало m2
+                    if (start2 < ip + m1.len)
+                    {
+                        if (start2 - ip < OPTIMAL_ML)
+                        {
+                            if (m1.len > OPTIMAL_ML)
+                                m1.len = OPTIMAL_ML;
+                            if (ip + m1.len > start2 + m2.len - ENCODE_MIN)
+                                m1.len = int(start2 - ip) + m2.len - ENCODE_MIN;
+                            const int correction = m1.len - int(start2 - ip);
+                            if (correction > 0)
+                            {
+                                start2 += correction;
+                                m2.len -= correction;
+                            }
+                        }
+                        else
+                            m1.len = int(start2 - ip);
+                    }
+                    encode(ip, m1);
+                    ip = start2;
+                    m1 = m2;
+                    start2 = start3;
+                    m2 = m3;
+                    goto search3;
+                }
+            }
+            if (anchor < data_end)
+                put(0, 0, anchor, int(data_end - anchor));
+        }
+
+    public:
+        void compress_dispatch()
+        {
+            if (level.lazy_searches)
+                compress_lazy(level.lazy_searches);
+            else
+                compress();
+        }
     };
 
     inline void compress(const uint8_t *begin, const uint8_t *end, Put_function put, int level = DEFAULT_LEVEL)
     {
         level = std::clamp(level, MIN_LEVEL, MAX_LEVEL);
-        auto ts = TokenSearcher(begin, end, put, LEVELS[level - 1]);
-        ts.compress();
+        auto lv = LEVELS[level - 1];
+        auto ts = TokenSearcher(begin, end, put, lv);
+        ts.compress_dispatch();
     }
 
     /* expand operators */
